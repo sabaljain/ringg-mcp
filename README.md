@@ -93,7 +93,21 @@ All writes go through `PATCH /agent/v1` with an `operation` discriminator.
 | `update_agent_prompt` | `edit_prompt` | Section-wise. **Read-merge-write** by default. |
 | `update_custom_variables` | `edit_custom_vars` | `add` / `remove` deltas. **Read-merge-write.** |
 | `attach_knowledge_base` | `attach_kb` | Additive; reports attachments before and after. |
-| `detach_knowledge_base` | `remove_kb` | Reports attachments before and after. |
+| `detach_knowledge_base` | `remove_kb` | Detaches the one `kb_id`; reports attachments before and after. |
+
+The endpoint's full contract — every operation, field and error code — is kept in
+[`docs/edit-agent-api.md`](docs/edit-agent-api.md). That file is the source of truth for
+this server's write path; the four operations above are the only ones it drives.
+
+**Writes are pinned to the version they were read from.** Agent config lives on an agent
+*version*, and `PATCH /agent/v1` accepts `version_id`. Each write tool sends the id of the
+version it read the current state from, so the merge and the write cannot land on
+different A/B variants. Every write tool takes an optional `version_id` to override that,
+and the KB tools take `is_draft` for editing a multi-node agent's draft.
+
+`update_custom_variables` also takes `config_type` (`outbound` | `inbound`), which only
+means anything on an `outbound_inbound` agent — those keep two copies of the runtime
+config. It is ignored elsewhere, and the tool says so rather than silently dropping it.
 
 Both merge-based tools exist because **the upstream API replaces the entire field on
 every write**. `update_custom_variables` reads the current variable list, applies your
@@ -103,6 +117,10 @@ title; pass `mode: "replace"` to deliberately discard the sections you did not s
 
 If `update_agent_prompt` cannot locate the agent's existing sections, it **refuses to
 write** rather than silently dropping sections it could not see.
+
+`update_custom_variables` **refuses to remove `callee_name` or `mobile_number` from an
+outbound agent**. The platform rejects such a list with `403`, so the tool fails locally
+with a message naming the variable instead of spending a round trip to be told no.
 
 ### Out of scope, deliberately
 
@@ -245,6 +263,14 @@ workspace in September 2026; your results may differ.
 The most structurally important item is #0: **agents are versioned**, and the config
 fields live on the agent's active version rather than on the agent object itself.
 
+**Superseded in part.** [`docs/edit-agent-api.md`](docs/edit-agent-api.md) is a platform
+reference for `PATCH /agent/v1` that post-dates these notes and settles several of them:
+`version_id` / `is_draft` / `config_type` are documented common fields, `edit_event_subscriptions`
+is real (#1), `remove_kb` takes a `kb_id` and detaches only that one (#3), and multi-node
+agents are edited through a separate family of flow operations (#4b). Items updated below
+say so inline. Everything still marked ✅ OBSERVED concerns the **read** path, which that
+reference does not cover.
+
 **0. Agents are versioned.** ✅ OBSERVED
 
 ```
@@ -277,8 +303,13 @@ The version layer is not described in the reference. Consequences, all handled i
   configuration.
 - Reading the agent root alone returns empty config for a good share of agents.
 
-**1. `edit_event_subscriptions` appears in prose but not in the OpenAPI spec.**
-`webhooks/initial-setup.md`, the body of `endpoint/assistant/edit-assistant.md`, and
+**1. `edit_event_subscriptions` appears in prose but not in the OpenAPI spec.** ☑️ SETTLED
+— `docs/edit-agent-api.md` section 4.3 documents the operation and its full payload
+(`event_type`, `callback_url`, `headers`, `method_type`, `auth_fetch_config`), so the
+OpenAPI omission was a spec gap. Webhook management remains out of scope here; the note
+below still describes what `get_agent` surfaces read-only.
+
+Originally: `webhooks/initial-setup.md`, the body of `endpoint/assistant/edit-assistant.md`, and
 `skill.md` (3 places) all document `operation: "edit_event_subscriptions"`. The
 `operation` enum in `openapi.json` does not contain it, and `event_subscriptions` appears
 **zero** times in the spec. The prose and the embedded OpenAPI block on the
@@ -313,6 +344,10 @@ returns the two as distinct fields.
 `version_details.<active>.knowledge_bases`, an array, so an agent can hold more than
 one. Attach/detach are additive, and `get_agent` always returns an array.
 
+☑️ `docs/edit-agent-api.md` section 4.2 confirms the write side: `attach_kb` and
+`remove_kb` both require a `kb_id`, and `remove_kb` detaches exactly that one. The
+detach tool no longer hedges about whether it might detach the whole set.
+
 **4. The prompt is not in the documented read schema.** ✅ OBSERVED
 `GET /agent/{agent_id}` documents only `agent_config` as a bare `object` with no
 properties. Live, the prompt is at
@@ -323,8 +358,10 @@ values are not enumerated in the reference; those observed were:
 
 `extractPromptSections()` targets the active version first and refuses to walk
 `version_details` blindly. ✅ A live round trip on an A/B agent confirmed that
-`PATCH /agent/v1` writes to the same version the resolver reads, so read and write stay in
-agreement. `update_agent_prompt` refuses to merge when it cannot locate the sections.
+`PATCH /agent/v1` writes to the same version the resolver reads. ☑️ The write path no
+longer relies on that: `version_id` is a documented field on every operation, so each
+write tool now sends the id of the version it read, making the agreement explicit instead
+of observed. `update_agent_prompt` refuses to merge when it cannot locate the sections.
 
 Section titles are **per-template, not a fixed set** — two agents in this workspace use
 different ones. Read them with `get_agent` before writing.
@@ -332,9 +369,16 @@ different ones. Read them with `get_agent` before writing.
 **4b. `orchestration_mode` changes the payload shape.** ✅ OBSERVED
 Agents are either `single_node` (single prompt) or `multi_node` (multi-prompt). For a
 `multi_node` agent, `GET /agent/{id}` returns a much thinner payload: `agent_prompt` is
-`null`, and the node graph holding the actual script is **not returned at all**. Prompt
-editing is therefore impossible for these agents, and `update_agent_prompt` detects the
-mode and says so explicitly rather than reporting a vague "sections not found".
+`null`, and the node graph holding the actual script is **not returned at all**.
+`edit_prompt` does not reach that graph, so `update_agent_prompt` detects the mode and
+says so explicitly rather than reporting a vague "sections not found".
+
+☑️ These agents are not uneditable, though — `docs/edit-agent-api.md` sections 4.6–4.8
+document a whole family of flow operations (`add_flow_node`, `edit_node_messages`,
+`edit_node_per_type_config`, edges, per-node voice and DTMF overrides) that edit the graph
+node by node, against a version or its draft. This server does not expose them: they need
+the graph read back to be usable, and `GET /agent/{id}` does not return it. The tool now
+names them in its error so the limitation is attributable rather than mysterious.
 
 **4c. For multi-prompt agents, KB writes succeed but reads do not reflect them.** ✅ OBSERVED
 `version_details.<active>.knowledge_bases` is **absent entirely** on a `multi_node`

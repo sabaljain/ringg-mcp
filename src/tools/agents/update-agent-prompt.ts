@@ -1,6 +1,6 @@
 import { z } from "zod";
-import { editAgent, getPromptSections } from "../../ringg/agents.js";
-import { RinggShapeError } from "../../ringg/errors.js";
+import { editAgent, getPromptSections, resolveWriteVersionId } from "../../ringg/agents.js";
+import { RinggApiError, RinggShapeError } from "../../ringg/errors.js";
 import { mergePromptSections, type PromptSection } from "../../ringg/normalize.js";
 import { defineTool } from "../types.js";
 
@@ -24,7 +24,10 @@ export const updateAgentPromptTool = defineTool({
     "every other section, and writes the complete section list back - the upstream API replaces " +
     "the whole prompt, so the merge is what protects the sections you did not mention. " +
     "Use mode='replace' to set the prompt to exactly the sections you supply, discarding the rest. " +
-    "Call get_agent first to see the existing section titles.",
+    "Call get_agent first to see the existing section titles. " +
+    "Section content may contain Jinja placeholders; the platform validates the syntax and rejects " +
+    "a malformed template, so an unclosed {{ or {% will fail the whole write. " +
+    "Single-prompt (single_node) agents only.",
   inputSchema: {
     agent_id: z.string().min(1).describe("The agent's UUID."),
     sections: z
@@ -37,6 +40,15 @@ export const updateAgentPromptTool = defineTool({
       .describe(
         "'merge' (default) keeps existing sections you did not name. " +
           "'replace' discards every section you did not supply.",
+      ),
+    version_id: z
+      .string()
+      .min(1)
+      .optional()
+      .describe(
+        "Target a specific agent version. Defaults to the version the merge was read from, so " +
+          "read and write stay on the same version. Only worth setting for an A/B agent where " +
+          "you want a non-live variant; see get_agent for the ids.",
       ),
   },
   annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
@@ -52,18 +64,21 @@ export const updateAgentPromptTool = defineTool({
     let added: string[] = [];
     let removed: string[] = [];
     let readSource = "not read (mode=replace)";
+    let versionId: string | undefined = args.version_id;
 
     if (args.mode === "merge") {
       const { agent, prompt } = await getPromptSections(client, args.agent_id);
+      versionId = args.version_id ?? resolveWriteVersionId(agent);
       if (!prompt) {
         // Multi-prompt agents have no prompt_sections at all - their script lives in a
-        // node graph this endpoint does not return. Say so plainly instead of implying
-        // the sections merely could not be located.
+        // node graph. edit_prompt does not reach it; the platform edits those nodes
+        // through separate flow operations this server does not expose.
         if (agent.orchestration_mode === "multi_node") {
           throw new RinggShapeError(
             "This is a multi-prompt agent (orchestration_mode: multi_node). Its script lives in a " +
-              "node graph rather than in prompt sections, and the Ringg API neither returns that " +
-              "graph nor accepts edit_prompt for it. Edit multi-prompt agents in the Ringg dashboard. " +
+              "node graph rather than in prompt sections, and edit_prompt does not reach it. The " +
+              "platform edits those nodes through separate flow operations (edit_node_messages and " +
+              "friends) that this server does not expose - use the Ringg dashboard. " +
               "This tool works on single-prompt (single_node) agents.",
           );
         }
@@ -93,6 +108,7 @@ export const updateAgentPromptTool = defineTool({
       const { agent, prompt } = await getPromptSections(client, args.agent_id).catch(
         () => ({ agent: {} as Record<string, unknown>, prompt: null }),
       );
+      versionId = args.version_id ?? resolveWriteVersionId(agent);
       if (agent.orchestration_mode === "multi_node") {
         throw new RinggShapeError(
           "This is a multi-prompt agent (orchestration_mode: multi_node). Its script lives in a " +
@@ -107,12 +123,30 @@ export const updateAgentPromptTool = defineTool({
       removed = before.filter((b) => !incoming.some((s) => same(s.section_title, b)));
     }
 
-    const response = await editAgent(client, "edit_prompt", args.agent_id, {
-      agent_prompt: { prompt_sections: finalSections },
-    });
+    let response: unknown;
+    try {
+      response = await editAgent(
+        client,
+        "edit_prompt",
+        args.agent_id,
+        { agent_prompt: { prompt_sections: finalSections } },
+        { versionId },
+      );
+    } catch (err) {
+      // The platform validates Jinja in section content and answers 400. Say which
+      // failure this is, so the caller fixes the template instead of retrying blind.
+      if (err instanceof RinggApiError && err.status === 400 && /jinja|template|syntax/i.test(err.message)) {
+        throw new RinggShapeError(
+          `Ringg rejected the prompt as an invalid Jinja template, so nothing was written: ${err.message} ` +
+            "Check the section content for an unclosed {{ ... }} or {% ... %}.",
+        );
+      }
+      throw err;
+    }
 
     return {
       agent_id: args.agent_id,
+      version_id: versionId,
       mode: args.mode,
       read_from: readSource,
       sections_before: before,
