@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { editAgent, getAgentRaw } from "../../ringg/agents.js";
+import { editAgent, getAgentRaw, resolveWriteVersionId } from "../../ringg/agents.js";
 import { RinggApiError } from "../../ringg/errors.js";
 import { extractKnowledgeBases, knowledgeBasesReadable } from "../../ringg/normalize.js";
 import { defineTool } from "../types.js";
@@ -10,19 +10,37 @@ export const attachKnowledgeBaseTool = defineTool({
   description:
     "Attach a knowledge base to an agent so it can answer from those documents during calls. " +
     "An agent may hold more than one knowledge base, so this is additive and does not replace " +
-    "existing attachments. The result reports the agent's attachments before and after. " +
+    "existing attachments. Attachments live on an agent version, so the attachment is made on the " +
+    "version this tool read. The result reports the agent's attachments before and after. " +
     "Note: for multi-prompt agents the Ringg API accepts the attachment but does not report " +
     "attachments back, so the result will say the outcome could not be verified. " +
-    "Use list_knowledge_bases to find a kb_id.",
+    "The knowledge base must belong to the same workspace. Use list_knowledge_bases to find a kb_id.",
   inputSchema: {
     agent_id: z.string().min(1).describe("The agent's UUID."),
     kb_id: z.string().min(1).describe("The knowledge base UUID, from list_knowledge_bases."),
+    version_id: z
+      .string()
+      .min(1)
+      .optional()
+      .describe(
+        "Attach to a specific agent version. Defaults to the version this tool read the current " +
+          "attachments from. Only worth setting for an A/B agent; see get_agent for the ids.",
+      ),
+    is_draft: z
+      .boolean()
+      .optional()
+      .describe(
+        "Multi-prompt (multi_node) agents only: attach to the draft of the target version rather " +
+          "than the version itself, leaving the live config untouched until the draft is published. " +
+          "Requires a resolvable version. Single-prompt agents ignore it.",
+      ),
   },
   annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   async handler(args, { client }) {
     const agentBefore = await getAgentRaw(client, args.agent_id);
     const before = extractKnowledgeBases(agentBefore);
     const readable = knowledgeBasesReadable(agentBefore);
+    const versionId = args.version_id ?? resolveWriteVersionId(agentBefore);
 
     if (readable && before.some((kb) => kb.kb_id === args.kb_id)) {
       return {
@@ -37,14 +55,22 @@ export const attachKnowledgeBaseTool = defineTool({
 
     let response: unknown;
     try {
-      response = await editAgent(client, "attach_kb", args.agent_id, { kb_id: args.kb_id });
+      response = await editAgent(
+        client,
+        "attach_kb",
+        args.agent_id,
+        { kb_id: args.kb_id },
+        { versionId, isDraft: args.is_draft },
+      );
     } catch (err) {
       // Already-attached is a benign outcome, not a failure - and it is the only signal
-      // available on agents whose attachments cannot be read back.
+      // available on agents whose attachments cannot be read back. The platform answers
+      // 400 for it (docs/edit-agent-api.md section 4.2).
       if (err instanceof RinggApiError && err.status === 400 && /already attached/i.test(err.message)) {
         return {
           agent_id: args.agent_id,
           kb_id: args.kb_id,
+          version_id: versionId,
           attached_before: before,
           changed: false,
           verified: readable,
@@ -61,6 +87,7 @@ export const attachKnowledgeBaseTool = defineTool({
       return {
         agent_id: args.agent_id,
         kb_id: args.kb_id,
+        version_id: versionId,
         changed: true,
         verified: false,
         message:
@@ -74,6 +101,7 @@ export const attachKnowledgeBaseTool = defineTool({
     return {
       agent_id: args.agent_id,
       kb_id: args.kb_id,
+      version_id: versionId,
       attached_before: before,
       attached_after: after,
       changed: true,

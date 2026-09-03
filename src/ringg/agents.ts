@@ -4,9 +4,13 @@
  * All writes go through PATCH /agent/v1 with an `operation` discriminator.
  * PATCH /public/agent/{agent_id} is deliberately unused: docs.ringg.ai/AGENTS.md states
  * it is not to be treated as a public documented endpoint.
+ *
+ * The authoritative contract for the write path is docs/edit-agent-api.md (platform
+ * reference for PATCH /ca/api/v0/agent/v1). Section numbers cited below refer to it.
  */
 
 import type { RinggClient } from "./client.js";
+import { RinggShapeError } from "./errors.js";
 import {
   extractCustomVariableNames,
   extractKnowledgeBases,
@@ -23,8 +27,39 @@ import {
   type PromptSectionsResult,
 } from "./normalize.js";
 
-/** Operations accepted by PATCH /agent/v1 that this server uses. */
+/**
+ * Operations accepted by PATCH /agent/v1 that this server drives.
+ *
+ * The endpoint accepts ~60 operations (docs/edit-agent-api.md section 4) covering voice,
+ * call config, tools, A/B versions and the multi-node flow graph. This server exposes
+ * only these four on purpose; see tools/registry.ts for the scope rationale.
+ */
 export type AgentEditOperation = "edit_prompt" | "edit_custom_vars" | "attach_kb" | "remove_kb";
+
+/**
+ * Which copy of the runtime config an edit targets. Only meaningful for agents whose
+ * `agent_type` is `outbound_inbound`; every other agent type ignores it (section 2).
+ */
+export type ConfigType = "outbound" | "inbound";
+
+/**
+ * Fields every operation accepts alongside its own payload (section 2).
+ *
+ * `versionId` is the important one: agents are versioned and the config lives on a
+ * version, so pinning the write to the version we just read is what keeps read and
+ * write in agreement on an A/B agent. Omitted, the backend picks the active version
+ * (falling back to the most recently updated non-archived one).
+ */
+export interface EditAgentOptions {
+  /** Target agent version. Omit to let the backend resolve the active version. */
+  versionId?: string;
+  /** Multi-node agents only: edit the draft of `versionId`. Requires `versionId`. */
+  isDraft?: boolean;
+  /** Caller's belief that no draft exists yet. An existing draft is adopted either way. */
+  newDraft?: boolean;
+  /** Routes runtime-config edits to the inbound copy on an `outbound_inbound` agent. */
+  configType?: ConfigType;
+}
 
 export interface AgentSummary {
   id?: string;
@@ -209,16 +244,61 @@ export interface EditAgentResult {
   [key: string]: unknown;
 }
 
-/** PATCH /agent/v1 - the single write path for every agent mutation. */
+/**
+ * PATCH /agent/v1 - the single write path for every agent mutation.
+ *
+ * `options` carries the common envelope fields (section 2). `is_draft` and `new_draft`
+ * are only sent together, and only when a draft edit is actually requested: sending
+ * `is_draft: true` without a `version_id` is a schema error upstream, so it is caught
+ * here with a message that says what to do instead.
+ */
 export async function editAgent(
   client: RinggClient,
   operation: AgentEditOperation,
   agentId: string,
   payload: Record<string, unknown>,
+  options: EditAgentOptions = {},
 ): Promise<EditAgentResult> {
-  const body = { operation, agent_id: agentId, ...payload };
+  if (options.isDraft && !options.versionId) {
+    throw new RinggShapeError(
+      "Editing a draft requires the version it belongs to. Supply version_id (get_agent " +
+        "reports the agent's version ids) or drop is_draft to edit the active version directly.",
+    );
+  }
+
+  const body: Record<string, unknown> = { operation, agent_id: agentId, ...payload };
+  if (options.versionId) body.version_id = options.versionId;
+  if (options.isDraft !== undefined) {
+    body.is_draft = options.isDraft;
+    // Always paired: the backend adopts an existing draft either way, so false is safe.
+    body.new_draft = options.newDraft ?? false;
+  }
+  if (options.configType) body.config_type = options.configType;
+
   const res = await client.patch<EditAgentResult>("/agent/v1", body);
   return (res ?? {}) as EditAgentResult;
+}
+
+/**
+ * The version id a write should be pinned to, or undefined when it cannot be resolved.
+ *
+ * Returns the version `getActiveVersion()` read from, so a tool that reads-merges-writes
+ * lands its write on the version it based the merge on. Undefined means "let the backend
+ * choose" - which is correct for unversioned payloads and for a genuinely ambiguous A/B
+ * split, where the calling tool warns rather than guessing.
+ */
+export function resolveWriteVersionId(agent: Json): string | undefined {
+  const active = getActiveVersion(agent);
+  if (active) return active.versionId;
+  return typeof agent.active_agent_version_id === "string" ? agent.active_agent_version_id : undefined;
+}
+
+/**
+ * Whether an edit to this agent's runtime config needs a `config_type` decision.
+ * Only `outbound_inbound` agents keep two copies of the config (section 2).
+ */
+export function hasSplitConfig(agent: Json): boolean {
+  return agent.agent_type === "outbound_inbound";
 }
 
 function str(value: unknown): string | undefined {

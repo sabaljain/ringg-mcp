@@ -111,9 +111,14 @@ export class RinggApiError extends Error {
       case 401:
         return "RINGG_API_KEY is missing, invalid, or was rotated";
       case 403:
-        return "key is valid but lacks permission for this action";
+        return (
+          "key lacks permission for this action, or the write is forbidden - PATCH /agent/v1 " +
+          "answers 403 when an outbound agent's custom variables would lose callee_name or mobile_number"
+        );
       case 404:
         return "resource does not exist in this workspace";
+      case 409:
+        return "conflicts with existing state (e.g. an inbound number already in a pool in active use)";
       case 429:
         return "rate limit exceeded; back off and retry";
       default:
