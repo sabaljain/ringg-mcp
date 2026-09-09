@@ -12,6 +12,8 @@
 import type { RinggClient } from "./client.js";
 import { RinggShapeError } from "./errors.js";
 import {
+  extractAbVersions,
+  extractClassificationLabels,
   extractCustomVariableNames,
   extractKnowledgeBases,
   describeVersionAmbiguity,
@@ -19,8 +21,10 @@ import {
   getActiveVersion,
   isObject,
   knowledgeBasesReadable,
+  readVersionField,
   unwrapAgentDetail,
   unwrapAgentList,
+  type AbVersionInfo,
   type Json,
   type KbAttachment,
   type PromptSection,
@@ -32,9 +36,33 @@ import {
  *
  * The endpoint accepts ~60 operations (docs/edit-agent-api.md section 4) covering voice,
  * call config, tools, A/B versions and the multi-node flow graph. This server exposes
- * only these four on purpose; see tools/registry.ts for the scope rationale.
+ * the subset below on purpose; see tools/registry.ts for the scope rationale.
  */
-export type AgentEditOperation = "edit_prompt" | "edit_custom_vars" | "attach_kb" | "remove_kb";
+export type AgentEditOperation =
+  | "edit_prompt"
+  | "edit_custom_vars"
+  | "attach_kb"
+  | "remove_kb"
+  | "edit_intro_message"
+  | "edit_agent_display_name"
+  | "edit_custom_analysis_prompt"
+  | "edit_client_analysis"
+  | "edit_classification_labels"
+  | "edit_analytics_context"
+  | "add_new_ab_version"
+  | "edit_traffic"
+  | "toggle_ab_testing";
+
+/**
+ * A/B operations act on the agent itself rather than on a version's config, and the
+ * reference is explicit that they never take `is_draft` (section 2). Passing a version
+ * to one of these would be meaningless at best, so the tools that use them send none.
+ */
+export const AB_OPERATIONS: readonly AgentEditOperation[] = [
+  "add_new_ab_version",
+  "edit_traffic",
+  "toggle_ab_testing",
+];
 
 /**
  * Which copy of the runtime config an edit targets. Only meaningful for agents whose
@@ -123,6 +151,16 @@ export interface AgentDetail {
   knowledge_bases_readable: boolean;
   /** Configured webhook subscriptions. Read-only here - editing them is out of scope. */
   event_subscriptions?: unknown;
+  /** `{ label: description }`, stored on the agent rather than on a version. */
+  classification_labels: Record<string, string>;
+  /** Post-call extraction config: `{ prompt, keys, defaults }`, or null when unset. */
+  custom_analysis_prompt?: unknown;
+  /** `{ context, goal_key, keys, revenue }`, or null when unset. */
+  client_analysis?: unknown;
+  /** `{ platform_analytics: {...}, client_analytics: {...} }`. */
+  analytics_context?: unknown;
+  /** Every A/B version with its slug and traffic share. */
+  ab_versions: AbVersionInfo[];
   prompt: {
     sections: PromptSection[] | null;
     /** Where the sections were found, or why they were not. */
@@ -218,6 +256,11 @@ export function toAgentDetail(agent: Json): AgentDetail {
     knowledge_bases: extractKnowledgeBases(agent),
     knowledge_bases_readable: knowledgeBasesReadable(agent),
     event_subscriptions: v.event_subscriptions,
+    classification_labels: extractClassificationLabels(agent),
+    custom_analysis_prompt: readVersionField(agent, "custom_analysis_prompt").value,
+    client_analysis: readVersionField(agent, "client_analysis").value,
+    analytics_context: readVersionField(agent, "analytics_context").value,
+    ab_versions: extractAbVersions(agent),
     prompt: {
       sections: prompt?.sections ?? null,
       source: prompt

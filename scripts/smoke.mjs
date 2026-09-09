@@ -20,9 +20,18 @@ const EXPECTED_TOOLS = [
   "list_calls",
   "get_call",
   "update_agent_prompt",
+  "update_intro_message",
   "update_custom_variables",
+  "update_agent_display_name",
   "attach_knowledge_base",
   "detach_knowledge_base",
+  "update_custom_analysis_prompt",
+  "update_client_analysis",
+  "update_classification_labels",
+  "update_analytics_context",
+  "add_ab_version",
+  "update_traffic_split",
+  "toggle_ab_testing",
 ];
 
 if (!process.env.RINGG_API_KEY) {
@@ -103,7 +112,11 @@ async function main() {
 
   const list = await send("tools/list");
   const names = (list.result?.tools ?? []).map((t) => t.name).sort();
-  check("tools/list returns 10 tools", names.length === 10, `got ${names.length}`);
+  check(
+    `tools/list returns ${EXPECTED_TOOLS.length} tools`,
+    names.length === EXPECTED_TOOLS.length,
+    `got ${names.length}`,
+  );
   check(
     "tool names match the agreed scope",
     JSON.stringify(names) === JSON.stringify([...EXPECTED_TOOLS].sort()),

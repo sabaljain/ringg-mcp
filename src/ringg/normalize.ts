@@ -506,3 +506,100 @@ export function mergePromptSections(
 
   return { merged, updated, added };
 }
+
+/* ------------------------------------------- agent-level / version-level fields */
+
+/**
+ * Reads a field that lives on the agent's active version.
+ *
+ * Observed placement is not consistent, so all three known homes are tried in order
+ * and the one that answered is reported back:
+ *
+ *   version_details.<active>.<key>                custom_analysis_prompt, client_analysis,
+ *                                                 analytics_context
+ *   version_details.<active>.agent_config.<key>   intro_message, and analytics_context
+ *                                                 again on some agents
+ *   <root>.<key>                                  unversioned payloads
+ *
+ * `source` is surfaced by the tools so a caller can see where a value came from rather
+ * than trusting an unexplained read.
+ */
+export function readVersionField(agent: Json, key: string): { value: unknown; source: string } {
+  const active = getActiveVersion(agent);
+  if (active) {
+    if (active.version[key] !== undefined) {
+      return { value: active.version[key], source: `version_details.${active.versionId}.${key}` };
+    }
+    if (active.agentConfig[key] !== undefined) {
+      return {
+        value: active.agentConfig[key],
+        source: `version_details.${active.versionId}.agent_config.${key}`,
+      };
+    }
+  }
+  const cfg = isObject(agent.agent_config) ? agent.agent_config : undefined;
+  if (cfg && cfg[key] !== undefined) return { value: cfg[key], source: `agent_config.${key}` };
+  if (agent[key] !== undefined) return { value: agent[key], source: key };
+  return {
+    value: undefined,
+    source: active
+      ? `not present on version ${active.versionId}`
+      : "not present (no active version could be resolved)",
+  };
+}
+
+/**
+ * Classification labels are stored on the agent, not on a version (section 4.3), and
+ * were observed at the payload root as a flat `{ label: description }` map.
+ */
+export function extractClassificationLabels(agent: Json): Record<string, string> {
+  const raw = agent.classification_labels;
+  if (!isObject(raw)) return {};
+  const out: Record<string, string> = {};
+  for (const [label, description] of Object.entries(raw)) {
+    if (typeof description === "string") out[label] = description;
+  }
+  return out;
+}
+
+export interface AbVersionInfo {
+  version_id: string;
+  slug?: string;
+  description?: string | null;
+  /** Share of traffic this version receives. Observed as 0 or 1 on non-split agents. */
+  call_traffic?: number;
+}
+
+/**
+ * `ab_versions` -> `{ <version_id>: { slug, description, call_traffic } }` at the root.
+ * Returned as an array so the version id is never lost when the map is projected.
+ */
+export function extractAbVersions(agent: Json): AbVersionInfo[] {
+  const raw = isObject(agent.ab_versions) ? agent.ab_versions : undefined;
+  const details = isObject(agent.version_details) ? agent.version_details : undefined;
+  const source = raw ?? details;
+  if (!source) return [];
+  const out: AbVersionInfo[] = [];
+  for (const [versionId, value] of Object.entries(source)) {
+    const v = isObject(value) ? value : {};
+    out.push({
+      version_id: versionId,
+      slug: asString(v.slug) ?? asString(v.version_slug),
+      description: typeof v.description === "string" ? v.description : null,
+      call_traffic: typeof v.call_traffic === "number" ? v.call_traffic : undefined,
+    });
+  }
+  return out;
+}
+
+/**
+ * True when the stored intro message carries HTML markup.
+ *
+ * The dashboard editor stores rich text, and custom variables appear as mention spans
+ * (`<span data-type="mention" data-id="{{callee_name}}">@{{callee_name}}</span>`).
+ * `edit_intro_message` converts whatever it is given to text, so overwriting a rich
+ * intro flattens it - the tools warn rather than letting that happen silently.
+ */
+export function looksLikeHtml(value: unknown): boolean {
+  return typeof value === "string" && /<\/?[a-z][^>]*>/i.test(value);
+}
