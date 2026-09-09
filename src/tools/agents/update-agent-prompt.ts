@@ -53,6 +53,9 @@ export const updateAgentPromptTool = defineTool({
   },
   annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
   async handler(args, { client, logger }) {
+    // Never let an absent mode select the destructive branch: the schema default only
+    // applies when the caller went through validation, and 'replace' discards sections.
+    const mode = args.mode ?? "merge";
     const incoming: PromptSection[] = args.sections.map((s) => ({
       section_title: s.section_title,
       section_content: s.section_content,
@@ -66,7 +69,7 @@ export const updateAgentPromptTool = defineTool({
     let readSource = "not read (mode=replace)";
     let versionId: string | undefined = args.version_id;
 
-    if (args.mode === "merge") {
+    if (mode === "merge") {
       const { agent, prompt } = await getPromptSections(client, args.agent_id);
       versionId = args.version_id ?? resolveWriteVersionId(agent);
       if (!prompt) {
@@ -135,10 +138,15 @@ export const updateAgentPromptTool = defineTool({
     } catch (err) {
       // The platform validates Jinja in section content and answers 400. Say which
       // failure this is, so the caller fixes the template instead of retrying blind.
-      if (err instanceof RinggApiError && err.status === 400 && /jinja|template|syntax/i.test(err.message)) {
+      // The platform's own message names the section and the offending construct, which
+      // beats anything synthesized here - so only the "nothing was written" fact is added.
+      if (
+        err instanceof RinggApiError &&
+        err.status === 400 &&
+        /jinja|template|the block|never closed|syntax/i.test(err.message)
+      ) {
         throw new RinggShapeError(
-          `Ringg rejected the prompt as an invalid Jinja template, so nothing was written: ${err.message} ` +
-            "Check the section content for an unclosed {{ ... }} or {% ... %}.",
+          `Ringg rejected the prompt as an invalid template, so nothing was written. ${err.message}`,
         );
       }
       throw err;
@@ -147,7 +155,7 @@ export const updateAgentPromptTool = defineTool({
     return {
       agent_id: args.agent_id,
       version_id: versionId,
-      mode: args.mode,
+      mode,
       read_from: readSource,
       sections_before: before,
       sections_after: finalSections.map((s) => s.section_title),

@@ -64,7 +64,7 @@ error message and log line.
 | Tool | Endpoint | Notes |
 |---|---|---|
 | `list_agents` | `GET /agent/all` | Paginated. `limit`/`offset` always sent explicitly. |
-| `get_agent` | `GET /agent/{agent_id}` | Prompt sections, custom variables, KB attachments (always an array), voice, languages, tools. |
+| `get_agent` | `GET /agent/{agent_id}` | Prompt sections, custom variables, KB attachments (always an array), voice, languages, tools, classification labels, analysis config, A/B versions. |
 | `list_knowledge_bases` | `GET /external/kb/all` | Bare array upstream; no pagination. |
 | `get_knowledge_base` | `GET /external/kb/{kb_id}` | Status plus the files / URLs / FAQs inventory. |
 | `list_calls` | `GET /calling/history` | **Summaries only** — transcripts are stripped (see below). |
@@ -88,16 +88,42 @@ response:
 
 All writes go through `PATCH /agent/v1` with an `operation` discriminator.
 
+**Agent configuration**
+
 | Tool | Operation | Semantics |
 |---|---|---|
 | `update_agent_prompt` | `edit_prompt` | Section-wise. **Read-merge-write** by default. |
+| `update_intro_message` | `edit_intro_message` | Replaces the greeting outright. Warns when it is flattening dashboard rich text. |
 | `update_custom_variables` | `edit_custom_vars` | `add` / `remove` deltas. **Read-merge-write.** |
+| `update_agent_display_name` | `edit_agent_display_name` | Cosmetic rename. Agent-level. |
+
+**Knowledge bases**
+
+| Tool | Operation | Semantics |
+|---|---|---|
 | `attach_knowledge_base` | `attach_kb` | Additive; reports attachments before and after. |
 | `detach_knowledge_base` | `remove_kb` | Detaches the one `kb_id`; reports attachments before and after. |
 
+**Post-call analysis**
+
+| Tool | Operation | Semantics |
+|---|---|---|
+| `update_custom_analysis_prompt` | `edit_custom_analysis_prompt` | Extraction prompt + typed keys. **Read-merge-write**; `clear` to remove. |
+| `update_client_analysis` | `edit_client_analysis` | `context` / `goal_key` / `keys` / `revenue`. Merged upstream at the top level only. |
+| `update_classification_labels` | `edit_classification_labels` | `set` / `remove` deltas, max 10. **Read-merge-write.** Agent-level. |
+| `update_analytics_context` | `edit_analytics_context` | Tool-call-log switches. Deep-merged upstream. |
+
+**A/B versions**
+
+| Tool | Operation | Semantics |
+|---|---|---|
+| `add_ab_version` | `add_new_ab_version` | Clones a version; returns the new `version_id`. Starts with no traffic. |
+| `update_traffic_split` | `edit_traffic` | `{ version_id: share }`, must sum to 1.0. **Affects live calls.** |
+| `toggle_ab_testing` | `toggle_ab_testing` | On/off. Disabling needs one version and no calls in flight. |
+
 The endpoint's full contract — every operation, field and error code — is kept in
 [`docs/edit-agent-api.md`](docs/edit-agent-api.md). That file is the source of truth for
-this server's write path; the four operations above are the only ones it drives.
+this server's write path.
 
 **Writes are pinned to the version they were read from.** Agent config lives on an agent
 *version*, and `PATCH /agent/v1` accepts `version_id`. Each write tool sends the id of the
@@ -109,11 +135,24 @@ and the KB tools take `is_draft` for editing a multi-node agent's draft.
 means anything on an `outbound_inbound` agent — those keep two copies of the runtime
 config. It is ignored elsewhere, and the tool says so rather than silently dropping it.
 
-Both merge-based tools exist because **the upstream API replaces the entire field on
+The merge-based tools exist because **the upstream API replaces the entire field on
 every write**. `update_custom_variables` reads the current variable list, applies your
 add/remove as a set operation, and writes the whole list back, so variables you did not
 mention survive. `update_agent_prompt` does the same for prompt sections, matching by
-title; pass `mode: "replace"` to deliberately discard the sections you did not supply.
+title; `update_classification_labels` and `update_custom_analysis_prompt` do the same for
+their maps. Each takes `mode: "replace"` to deliberately discard what you did not supply,
+and reports what that discarded.
+
+Where the *platform* merges — `edit_client_analysis` (top level only) and
+`edit_analytics_context` (deep) — the tools pass through rather than re-merging, and
+`update_client_analysis` warns when a nested `keys` or `revenue` object you send would
+drop entries the stored one had.
+
+**Validation happens before the write, not after a 400.** Traffic shares that do not sum
+to 1.0, a version id that does not belong to the agent, an analysis default with no
+matching key or the wrong type for its key, an 11th classification label, a blank label
+description — each is refused locally with a message naming the offending value, so no
+request is sent.
 
 If `update_agent_prompt` cannot locate the agent's existing sections, it **refuses to
 write** rather than silently dropping sections it could not see.
@@ -122,11 +161,24 @@ write** rather than silently dropping sections it could not see.
 outbound agent**. The platform rejects such a list with `403`, so the tool fails locally
 with a message naming the variable instead of spending a round trip to be told no.
 
+`update_intro_message` warns when it is about to flatten rich text. The dashboard stores
+the greeting as HTML, and custom variables appear there as mention spans
+(`<span data-type="mention" data-id="{{callee_name}}">@{{callee_name}}</span>`).
+`edit_intro_message` converts whatever it receives to text, so writing through this tool
+loses the editor's chip rendering — the variable references themselves keep working.
+
 ### Out of scope, deliberately
 
 Individual calls, campaigns, call termination, knowledge base create/edit/delete, number
-provisioning, telephony config, analytics, and workspace user management. `scripts/check-stdout-purity.sh`
+provisioning, telephony config, and workspace user management. `scripts/check-stdout-purity.sh`
 enforces that none of those endpoints appear in the code.
+
+Two write operations are within reach but deliberately absent. `delete_version` and
+`push_to_prod` (reference section 4.5) archive versions and retire production config;
+they belong to a dashboard's confirm-dialog, not to a tool an agent can call in a loop.
+The **flow-graph operations** (sections 4.6–4.8) are absent for a different reason — see
+item 4b below: `GET /agent/{id}` does not return the node graph, so a tool could neither
+read node ids nor verify what it wrote.
 
 ---
 
@@ -142,7 +194,7 @@ src/
     normalize.ts         Defensive readers for undocumented / inconsistent shapes
     agents.ts kb.ts calls.ts
   tools/
-    types.ts registry.ts   ToolDefinition + the 10-tool registry
+    types.ts registry.ts   ToolDefinition + the 19-tool registry
     agents/ kb/ calls/     One file per tool
   server.ts              createServer(deps) -> McpServer. Imports NO transport.
   transports/stdio.ts    The only stdio-aware file. Includes the stdout guard.
@@ -388,6 +440,61 @@ path works while the read path shows nothing. An empty array here means *unknown
 *none*. `get_agent` exposes `knowledge_bases_readable`, and the attach/detach tools return
 `verified: false` with an explanation instead of presenting a misleading `[] → []` diff.
 
+**4d. The analysis and A/B fields sit in four different places.** ✅ OBSERVED
+Inspected across 18 agents while building the analysis and A/B tools:
+
+| Field | Where it actually lives | Shape |
+|---|---|---|
+| `intro_message` | `version_details.<v>.agent_config.intro_message` | **HTML**, not text |
+| `custom_analysis_prompt` | `version_details.<v>.custom_analysis_prompt` | `{ prompt, keys: { name: "string" } }` |
+| `client_analysis` | `version_details.<v>.client_analysis` | `{ keys: { name: { type, default, description } } }` |
+| `analytics_context` | `version_details.<v>.analytics_context` **and** `…agent_config.analytics_context` | `{ platform_analytics, client_analytics }` |
+| `classification_labels` | **agent root** | `{ label: description }` |
+| `ab_versions` | **agent root** | `{ <version_id>: { slug, description, call_traffic } }` |
+
+Three things worth knowing:
+
+- **The two analysis fields use different key shapes.** `custom_analysis_prompt.keys` is
+  flat (`{ "amount": "number" }`); `client_analysis.keys` is nested
+  (`{ "amount": { type, default, description } }`). They read as siblings and are not.
+- **`analytics_context` was found in two places on the same agent**, and on one agent in
+  only one of them. `readVersionField()` tries the version, then `agent_config`, then the
+  root, and reports which answered.
+- **`intro_message` comes back as dashboard HTML**, including mention spans that render a
+  custom variable as a chip. The reference says `edit_intro_message` converts input to
+  text; live it does the opposite. Plain text in is wrapped in `<p>`, and each
+  `{{variable}}` is **upgraded** into the dashboard's mention markup; HTML in is stored
+  as given (`<b>` normalised to `<strong>`). A round trip is byte-identical, so there is
+  no formatting to lose. What is worth catching is that **a reference to a variable the
+  agent does not declare is accepted silently** and interpolates to nothing on a call, so
+  `update_intro_message` checks the names against `custom_variables` instead.
+
+**4e. `edit_traffic` merges; it does not replace.** ✅ OBSERVED
+This one costs real money if you miss it. Given versions v1 and v2 split 0.5/0.5, sending
+`traffic_split: { v1: 1.0 }` does **not** move v2 to zero — v2 keeps its 0.5, and the
+agent's total becomes **1.5**. The sum-to-1.0 rule is checked against the payload, not
+against the resulting state, so a partial split silently produces an invalid one. Deleting
+a version does not reclaim its share either: v1 was left holding 1.5.
+
+`update_traffic_split` therefore sends an explicit share for **every** version the agent
+has, filling omitted ones with `0`, and reports the resulting total.
+
+**4f. `client_analysis.goal_key` must name a key declared `boolean`.** ✅ OBSERVED
+Undocumented, enforced with `400 "client_analysis.goal_key must reference a boolean key in
+client_analysis.keys"`. The tool checks it locally against the keys the call establishes.
+
+**4g. `client_analysis` cannot be unset.** ✅ OBSERVED
+`edit_client_analysis` rejects both `null` (`422 'client_analysis' is required`) and `{}`
+(`422 a non-empty object is required`). Once the field is populated it stays populated;
+the closest to unset is `{ context: null, goal_key: null, keys: {}, revenue: {} }`. Worth
+knowing before setting it on an agent you care about.
+
+**4h. Jinja validation is real but partial.** ✅ OBSERVED
+`edit_prompt` and `edit_intro_message` reject an unclosed `{% ... %}` block and an unknown
+tag, naming the section and the construct. They **accept** an unclosed `{{ name`, a bad
+filter (`{{ name | }}`) and `{{{{ }}`. So a template error can still reach a live call —
+the validation is not a safety net.
+
 **5. Pagination defaults disagree.** `api-overview.md` says "default 20, max 100". The
 spec's `/agent/all` `limit` carries `default: 10` while *its own description on the same
 parameter* says "default: 20, max: 100". Mitigation: always send `limit`/`offset`
@@ -446,6 +553,11 @@ To run against your own Ringg workspace:
 
 Before testing the write tools, snapshot the target agent and use a disposable one: every
 write replaces the whole field upstream.
+
+**The write tools have been exercised end to end** against a disposable single-node agent:
+every one of the 13 was run, its effect confirmed by reading the agent back, and the agent
+restored from a snapshot afterwards. Items 4d–4h above are what that run turned up. One
+field could not be restored — see 4g.
 
 ## License
 

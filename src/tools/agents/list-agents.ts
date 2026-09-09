@@ -15,6 +15,8 @@ export const listAgentsTool = defineTool({
   },
   annotations: { readOnlyHint: true, openWorldHint: true },
   async handler(args, { client }) {
-    return listAgents(client, { limit: args.limit, offset: args.offset });
+    // Defaults restated here so a caller that bypasses schema validation still pages
+    // sensibly rather than sending undefined upstream.
+    return listAgents(client, { limit: args.limit ?? 20, offset: args.offset ?? 0 });
   },
 });
