@@ -593,13 +593,18 @@ export function extractAbVersions(agent: Json): AbVersionInfo[] {
 }
 
 /**
- * True when the stored intro message carries HTML markup.
+ * Names of the `{{ variable }}` references in a template string.
  *
- * The dashboard editor stores rich text, and custom variables appear as mention spans
- * (`<span data-type="mention" data-id="{{callee_name}}">@{{callee_name}}</span>`).
- * `edit_intro_message` converts whatever it is given to text, so overwriting a rich
- * intro flattens it - the tools warn rather than letting that happen silently.
+ * Used to check an intro message against the agent's declared custom variables. The
+ * platform accepts a reference to a variable that does not exist - it renders it as a
+ * mention either way - so an unnoticed typo would simply interpolate to nothing on a
+ * live call. Jinja expressions (filters, blocks) are ignored: only bare names count.
  */
-export function looksLikeHtml(value: unknown): boolean {
-  return typeof value === "string" && /<\/?[a-z][^>]*>/i.test(value);
+export function extractTemplateVariables(text: string): string[] {
+  const names: string[] = [];
+  for (const match of text.matchAll(/\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}/g)) {
+    const name = match[1];
+    if (name && !names.includes(name)) names.push(name);
+  }
+  return names;
 }

@@ -12,10 +12,12 @@ export const updateClientAnalysisTool = defineTool({
     "works from, which extracted key represents the call's goal, the keys themselves, and revenue " +
     "attribution. The platform merges what you send with the stored config at the top level, so " +
     "fields you omit are preserved - sending only 'context' leaves keys and revenue untouched. " +
-    "At least one field is required. Call get_agent first to see the current configuration; note " +
-    "that observed 'keys' entries are objects of the form " +
-    "{ type, default, description }, which differs from the flatter shape used by " +
-    "update_custom_analysis_prompt.",
+    "At least one field is required. 'goal_key' must name a key declared as boolean. " +
+    "Be aware that this configuration cannot be removed once set: the platform rejects both null " +
+    "and an empty object, so the closest to unset is emptying each field individually. " +
+    "Call get_agent first to see the current configuration; note that observed 'keys' entries are " +
+    "objects of the form { type, default, description }, which differs from the flatter shape used " +
+    "by update_custom_analysis_prompt.",
   inputSchema: {
     agent_id: z.string().min(1).describe("The agent's UUID."),
     context: z
@@ -65,6 +67,33 @@ export const updateClientAnalysisTool = defineTool({
     const current = readVersionField(agent, "client_analysis");
     const versionId = args.version_id ?? resolveWriteVersionId(agent);
     const existing = isObject(current.value) ? current.value : {};
+
+    // Undocumented, and enforced upstream with a bare 400: goal_key must name a key that
+    // is declared boolean. Checked against the keys this call establishes - the ones
+    // being sent, or the stored ones when keys are untouched.
+    if (typeof args.goal_key === "string") {
+      const effectiveKeys = isObject(args.keys)
+        ? args.keys
+        : isObject(existing.keys)
+          ? (existing.keys as Record<string, unknown>)
+          : undefined;
+      if (effectiveKeys) {
+        const entry = effectiveKeys[args.goal_key];
+        if (entry === undefined) {
+          throw new RinggShapeError(
+            `goal_key '${args.goal_key}' is not one of the client analysis keys. Available: ` +
+              `${Object.keys(effectiveKeys).join(", ") || "(none)"}. Declare it in 'keys' first.`,
+          );
+        }
+        const type = isObject(entry) ? entry.type : entry;
+        if (type !== "boolean") {
+          throw new RinggShapeError(
+            `goal_key must name a boolean key; '${args.goal_key}' is declared as ` +
+              `'${String(type)}'. The platform rejects anything else.`,
+          );
+        }
+      }
+    }
 
     const warnings: string[] = [];
     // Nested objects are replaced, not merged, so say what is about to be lost.

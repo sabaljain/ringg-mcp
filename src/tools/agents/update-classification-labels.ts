@@ -35,10 +35,22 @@ export const updateClassificationLabelsTool = defineTool({
   },
   annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
   async handler(args, { client }) {
+    // 'replace' discards labels, so an absent mode must not select it.
+    const mode = args.mode ?? "merge";
     const set = args.set ?? {};
     const remove = args.remove ?? [];
     if (Object.keys(set).length === 0 && remove.length === 0) {
       throw new Error("Supply at least one label in 'set' or a name in 'remove'.");
+    }
+
+    // Naming a label in both halves is contradictory. Resolving it silently either way
+    // would hide a mistake, so say so instead.
+    const contradictory = Object.keys(set).filter((label) => remove.includes(label));
+    if (contradictory.length > 0) {
+      throw new RinggShapeError(
+        `These labels appear in both 'set' and 'remove': ${contradictory.join(", ")}. ` +
+          "Decide which you meant and send only that.",
+      );
     }
 
     // Empty values are rejected upstream; catching it here names the offending label.
@@ -54,7 +66,7 @@ export const updateClassificationLabelsTool = defineTool({
     const agent = await getAgentRaw(client, args.agent_id);
     const before = extractClassificationLabels(agent);
 
-    const after: Record<string, string> = args.mode === "merge" ? { ...before } : {};
+    const after: Record<string, string> = mode === "merge" ? { ...before } : {};
     for (const name of remove) delete after[name];
     for (const [label, description] of Object.entries(set)) after[label] = description;
 
@@ -71,7 +83,7 @@ export const updateClassificationLabelsTool = defineTool({
 
     const warnings: string[] = [];
     if (notFound.length > 0) warnings.push(`Not present, so nothing to remove: ${notFound.join(", ")}`);
-    if (args.mode === "replace" && removed.length > 0) {
+    if (mode === "replace" && removed.length > 0) {
       warnings.push(`mode='replace' discarded ${removed.length} label(s): ${removed.join(", ")}`);
     }
 
@@ -82,7 +94,7 @@ export const updateClassificationLabelsTool = defineTool({
 
     return {
       agent_id: args.agent_id,
-      mode: args.mode,
+      mode,
       before,
       after,
       added,

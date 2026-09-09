@@ -7,7 +7,11 @@ import {
   type ConfigType,
 } from "../../ringg/agents.js";
 import { RinggApiError, RinggShapeError } from "../../ringg/errors.js";
-import { looksLikeHtml, readVersionField } from "../../ringg/normalize.js";
+import {
+  extractCustomVariableNames,
+  extractTemplateVariables,
+  readVersionField,
+} from "../../ringg/normalize.js";
 import { defineTool } from "../types.js";
 
 export const updateIntroMessageTool = defineTool({
@@ -16,12 +20,13 @@ export const updateIntroMessageTool = defineTool({
   description:
     "Set the first thing the agent says when a call connects. The message replaces the existing " +
     "one outright - there is no merge, because it is a single string. " +
-    "Reference custom variables with Jinja, e.g. 'Hi {{callee_name}}, calling from Acme.' The " +
-    "platform validates the Jinja syntax and rejects a malformed template. " +
-    "Note that the dashboard stores this as rich text: an intro written there arrives as HTML and " +
-    "may contain variable 'mention' markup. Writing through this tool replaces it with plain text, " +
-    "so the chips shown in the dashboard editor become ordinary text. The variable references " +
-    "themselves keep working. Call get_agent first to see the current message.",
+    "Reference custom variables as {{variable_name}}, e.g. 'Hi {{callee_name}}, calling from Acme.' " +
+    "Plain text is fine: the platform wraps it in HTML and turns each {{variable_name}} into the " +
+    "same mention markup the dashboard editor produces, so the greeting keeps working and still " +
+    "renders as chips there. HTML you pass is kept as-is. The platform rejects an unclosed Jinja " +
+    "block such as {% if %}. A reference to a variable the agent does not declare is accepted " +
+    "silently and interpolates to nothing on a live call, so this tool checks the names for you. " +
+    "Call get_agent first to see the current message.",
   inputSchema: {
     agent_id: z.string().min(1).describe("The agent's UUID."),
     intro_message: z
@@ -51,13 +56,23 @@ export const updateIntroMessageTool = defineTool({
     const versionId = args.version_id ?? resolveWriteVersionId(agent);
 
     const warnings: string[] = [];
-    if (looksLikeHtml(current.value)) {
+
+    // The platform accepts an unknown variable and renders it as a mention, so a typo
+    // only shows up as an empty gap on a live call. Checking the names here is the only
+    // place it can be caught.
+    const declared = extractCustomVariableNames(agent).map((n) => n.toLowerCase());
+    const referenced = extractTemplateVariables(args.intro_message);
+    const unknown = referenced.filter((name) => !declared.includes(name.toLowerCase()));
+    if (unknown.length > 0) {
       warnings.push(
-        "The existing intro message is HTML from the dashboard's rich-text editor. This write " +
-          "replaces it with plain text, so any variable 'mention' formatting is flattened. The " +
-          "variables still interpolate; only the editor's chip rendering is lost.",
+        `This message references ${unknown.map((n) => `{{${n}}}`).join(", ")}, which ${
+          unknown.length === 1 ? "is not a custom variable" : "are not custom variables"
+        } on this agent. The platform accepts the reference but it will interpolate to nothing on a ` +
+          `call. Declared variables: ${declared.length > 0 ? declared.join(", ") : "(none)"}. ` +
+          "Add the name with update_custom_variables, or correct the spelling.",
       );
     }
+
     if (args.config_type && !hasSplitConfig(agent)) {
       warnings.push(
         `config_type='${args.config_type}' was ignored: it only applies to agents whose agent_type ` +
@@ -75,10 +90,9 @@ export const updateIntroMessageTool = defineTool({
         { versionId, configType: args.config_type as ConfigType | undefined },
       );
     } catch (err) {
-      if (err instanceof RinggApiError && err.status === 400 && /jinja|template|syntax/i.test(err.message)) {
+      if (err instanceof RinggApiError && err.status === 400 && isTemplateError(err.message)) {
         throw new RinggShapeError(
-          `Ringg rejected the intro message as an invalid Jinja template, so nothing was written: ${err.message} ` +
-            "Check for an unclosed {{ ... }} or {% ... %}.",
+          `Ringg rejected the intro message as an invalid template, so nothing was written. ${err.message}`,
         );
       }
       throw err;
@@ -91,6 +105,7 @@ export const updateIntroMessageTool = defineTool({
       version_id: versionId,
       config_type: args.config_type,
       read_from: current.source,
+      variables_referenced: referenced,
       before: current.value ?? null,
       after: after.value ?? null,
       warnings: warnings.length > 0 ? warnings : undefined,
@@ -99,3 +114,14 @@ export const updateIntroMessageTool = defineTool({
     };
   },
 });
+
+/**
+ * Whether a 400 is the platform's template validator talking.
+ *
+ * Its messages name the offending construct ('the block "{% if x %}" is never closed'),
+ * which is more useful than anything this layer could synthesize - so the wrapper only
+ * adds the fact that nothing was written, and passes the original through.
+ */
+function isTemplateError(message: string): boolean {
+  return /jinja|template|the block|never closed|syntax/i.test(message);
+}

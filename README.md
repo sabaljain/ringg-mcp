@@ -461,9 +461,39 @@ Three things worth knowing:
   only one of them. `readVersionField()` tries the version, then `agent_config`, then the
   root, and reports which answered.
 - **`intro_message` comes back as dashboard HTML**, including mention spans that render a
-  custom variable as a chip. `edit_intro_message` converts input to text, so a
-  read-then-write round trip flattens the markup. `update_intro_message` detects HTML in
-  the current value and says so before writing.
+  custom variable as a chip. The reference says `edit_intro_message` converts input to
+  text; live it does the opposite. Plain text in is wrapped in `<p>`, and each
+  `{{variable}}` is **upgraded** into the dashboard's mention markup; HTML in is stored
+  as given (`<b>` normalised to `<strong>`). A round trip is byte-identical, so there is
+  no formatting to lose. What is worth catching is that **a reference to a variable the
+  agent does not declare is accepted silently** and interpolates to nothing on a call, so
+  `update_intro_message` checks the names against `custom_variables` instead.
+
+**4e. `edit_traffic` merges; it does not replace.** ✅ OBSERVED
+This one costs real money if you miss it. Given versions v1 and v2 split 0.5/0.5, sending
+`traffic_split: { v1: 1.0 }` does **not** move v2 to zero — v2 keeps its 0.5, and the
+agent's total becomes **1.5**. The sum-to-1.0 rule is checked against the payload, not
+against the resulting state, so a partial split silently produces an invalid one. Deleting
+a version does not reclaim its share either: v1 was left holding 1.5.
+
+`update_traffic_split` therefore sends an explicit share for **every** version the agent
+has, filling omitted ones with `0`, and reports the resulting total.
+
+**4f. `client_analysis.goal_key` must name a key declared `boolean`.** ✅ OBSERVED
+Undocumented, enforced with `400 "client_analysis.goal_key must reference a boolean key in
+client_analysis.keys"`. The tool checks it locally against the keys the call establishes.
+
+**4g. `client_analysis` cannot be unset.** ✅ OBSERVED
+`edit_client_analysis` rejects both `null` (`422 'client_analysis' is required`) and `{}`
+(`422 a non-empty object is required`). Once the field is populated it stays populated;
+the closest to unset is `{ context: null, goal_key: null, keys: {}, revenue: {} }`. Worth
+knowing before setting it on an agent you care about.
+
+**4h. Jinja validation is real but partial.** ✅ OBSERVED
+`edit_prompt` and `edit_intro_message` reject an unclosed `{% ... %}` block and an unknown
+tag, naming the section and the construct. They **accept** an unclosed `{{ name`, a bad
+filter (`{{ name | }}`) and `{{{{ }}`. So a template error can still reach a live call —
+the validation is not a safety net.
 
 **5. Pagination defaults disagree.** `api-overview.md` says "default 20, max 100". The
 spec's `/agent/all` `limit` carries `default: 10` while *its own description on the same
@@ -523,6 +553,11 @@ To run against your own Ringg workspace:
 
 Before testing the write tools, snapshot the target agent and use a disposable one: every
 write replaces the whole field upstream.
+
+**The write tools have been exercised end to end** against a disposable single-node agent:
+every one of the 13 was run, its effect confirmed by reading the agent back, and the agent
+restored from a snapshot afterwards. Items 4d–4h above are what that run turned up. One
+field could not be restored — see 4g.
 
 ## License
 

@@ -63,6 +63,8 @@ export const updateCustomAnalysisPromptTool = defineTool({
   },
   annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
   async handler(args, { client }) {
+    // 'replace' discards keys, so an absent mode must not select it.
+    const mode = args.mode ?? "merge";
     const agent = await getAgentRaw(client, args.agent_id);
     const current = readVersionField(agent, "custom_analysis_prompt");
     const versionId = args.version_id ?? resolveWriteVersionId(agent);
@@ -97,7 +99,7 @@ export const updateCustomAnalysisPromptTool = defineTool({
     let prompt: string | undefined;
     const removed: string[] = [];
 
-    if (args.mode === "merge") {
+    if (mode === "merge") {
       keys = { ...existingKeys, ...(args.keys ?? {}) };
       defaults = { ...existingDefaults, ...(args.defaults ?? {}) };
       prompt = args.prompt ?? existingPrompt;
@@ -178,14 +180,14 @@ export const updateCustomAnalysisPromptTool = defineTool({
     return {
       agent_id: args.agent_id,
       version_id: versionId,
-      mode: args.mode,
+      mode,
       read_from: current.source,
       applies_to: agent.orchestration_mode === "multi_node" ? "targeted version only" : "all active versions",
       keys_before: Object.keys(existingKeys),
       keys_after: Object.keys(keys),
       removed,
       warning:
-        args.mode === "replace" && removed.length > 0
+        mode === "replace" && removed.length > 0
           ? `mode='replace' discarded ${removed.length} key(s): ${removed.join(", ")}`
           : undefined,
       api_response: response,

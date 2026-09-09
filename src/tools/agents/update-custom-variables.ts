@@ -63,6 +63,14 @@ export const updateCustomVariablesTool = defineTool({
       throw new Error("Supply at least one name in 'add' or 'remove'.");
     }
 
+    const contradictory = add.filter((name) => remove.some((r) => norm(r) === norm(name)));
+    if (contradictory.length > 0) {
+      throw new Error(
+        `These names appear in both 'add' and 'remove': ${contradictory.join(", ")}. ` +
+          "Decide which you meant and send only that.",
+      );
+    }
+
     const agent = await getAgentRaw(client, args.agent_id);
     const before = extractCustomVariableNames(agent);
     const agentType = typeof agent.agent_type === "string" ? agent.agent_type : undefined;
