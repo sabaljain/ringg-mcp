@@ -1,7 +1,20 @@
 import { z } from "zod";
 import { editAgent, getPromptSections, resolveWriteVersionId } from "../../ringg/agents.js";
 import { RinggApiError, RinggShapeError } from "../../ringg/errors.js";
-import { mergePromptSections, type PromptSection } from "../../ringg/normalize.js";
+import {
+  extractCustomVariableNames,
+  extractKnowledgeBases,
+  mergePromptSections,
+  type PromptSection,
+} from "../../ringg/normalize.js";
+import { buildChangeReport, summarizeChangeReport } from "../../ringg/prompt-diff.js";
+import {
+  extractPromptVocabulary,
+  summarizeReferences,
+  validatePromptSections,
+  type Finding,
+  type PromptVocabulary,
+} from "../../ringg/prompt-refs.js";
 import { defineTool } from "../types.js";
 
 const sectionSchema = z.object({
@@ -24,9 +37,29 @@ export const updateAgentPromptTool = defineTool({
     "every other section, and writes the complete section list back - the upstream API replaces " +
     "the whole prompt, so the merge is what protects the sections you did not mention. " +
     "Use mode='replace' to set the prompt to exactly the sections you supply, discarding the rest. " +
-    "Call get_agent first to see the existing section titles. " +
-    "Section content may contain Jinja placeholders; the platform validates the syntax and rejects " +
-    "a malformed template, so an unclosed {{ or {% will fail the whole write. " +
+    "Call get_agent first to see the existing section titles and what the agent makes referenceable. " +
+    "\n\n" +
+    "EVERY WRITE IS CHECKED FIRST. The sections you supply are validated against the agent's " +
+    "custom variables, pre-call and on-call tools, and attached knowledge bases before anything " +
+    "is sent. If a problem is found nothing is written: the tool returns the findings with a " +
+    "concrete fix for each, for you to show the user and correct. Re-call with the corrections, " +
+    "or with acknowledge_findings=true once the user has seen them and wants to proceed anyway. " +
+    "On a successful write the result reports what changed, per section and per step, with the " +
+    "before and after text. Problems in sections you are NOT writing never block the write; they " +
+    "are reported separately as pre_existing_issues. " +
+    "\n\n" +
+    "PROMPT REFERENCE SYNTAX (five constructs, each with its own form):\n" +
+    "  - custom variable:    @{{variable_name}}\n" +
+    "  - pre-call tool data: @((tool_name.Dotted.Path))  - path must be one of that tool's response keys\n" +
+    "  - on-call tool:       @||tool_name||\n" +
+    "  - knowledge base:     inserted from the dashboard; binds via a UUID, so plain '@kb_name' text is inert\n" +
+    "  - control flow:       {% if %} / {% elif %} / {% else %} / {% endif %}\n" +
+    "A @(( )) value is substituted as TEXT before Jinja runs, so inside a {% %} statement it must " +
+    'be quoted: {% if "@((t.Path))" == "True" %}. Because it is text, a boolean arrives as the ' +
+    'string "True"/"False" - and "False" is truthy in Jinja, so test it with == "True" rather ' +
+    "than for truthiness. Custom variables are native Jinja names: test them bare, {% if channel " +
+    "== 'meta' %}. The platform rejects an unclosed {% %} block but accepts an unclosed {{ and a " +
+    "bad filter, so these checks are the only guard for the rest. " +
     "Single-prompt (single_node) agents only.",
   inputSchema: {
     agent_id: z.string().min(1).describe("The agent's UUID."),
@@ -40,6 +73,15 @@ export const updateAgentPromptTool = defineTool({
       .describe(
         "'merge' (default) keeps existing sections you did not name. " +
           "'replace' discards every section you did not supply.",
+      ),
+    acknowledge_findings: z
+      .boolean()
+      .default(false)
+      .describe(
+        "Write even though the pre-write checks found problems. Leave false so problems are " +
+          "reported instead of written. Set true only after showing the user the findings from a " +
+          "previous call and being told to proceed - never to get past a finding on your own " +
+          "judgement, and never on the first attempt.",
       ),
     version_id: z
       .string()
@@ -62,12 +104,14 @@ export const updateAgentPromptTool = defineTool({
     }));
 
     let finalSections: PromptSection[];
+    let existingSections: PromptSection[] = [];
     let before: string[] = [];
     let updated: string[] = [];
     let added: string[] = [];
     let removed: string[] = [];
     let readSource = "not read (mode=replace)";
     let versionId: string | undefined = args.version_id;
+    let vocabulary: PromptVocabulary | undefined;
 
     if (mode === "merge") {
       const { agent, prompt } = await getPromptSections(client, args.agent_id);
@@ -94,12 +138,14 @@ export const updateAgentPromptTool = defineTool({
             "(The prompt's location inside agent_config is not documented by Ringg.)",
         );
       }
+      existingSections = prompt.sections;
       before = prompt.sections.map((s) => s.section_title);
       readSource = `${prompt.sourcePath}${prompt.synthesized ? " (synthesized from flat prompt fields)" : ""}`;
       const merge = mergePromptSections(prompt.sections, incoming);
       finalSections = merge.merged;
       updated = merge.updated;
       added = merge.added;
+      vocabulary = buildVocabulary(agent);
 
       if (prompt.synthesized) {
         logger.warn(
@@ -119,11 +165,47 @@ export const updateAgentPromptTool = defineTool({
             "meaningless. Edit multi-prompt agents in the Ringg dashboard.",
         );
       }
-      before = prompt?.sections.map((s) => s.section_title) ?? [];
+      existingSections = prompt?.sections ?? [];
+      before = existingSections.map((s) => s.section_title);
       finalSections = incoming;
       added = incoming.map((s) => s.section_title).filter((t) => !before.some((b) => same(b, t)));
       updated = incoming.map((s) => s.section_title).filter((t) => before.some((b) => same(b, t)));
       removed = before.filter((b) => !incoming.some((s) => same(s.section_title, b)));
+      // A failed read leaves the vocabulary unknown. The checks that need no vocabulary
+      // (Jinja structure, quoting, truthiness) still run; name checks skip themselves.
+      vocabulary = buildVocabulary(agent);
+    }
+
+    // Validate what will actually be live, then split by whether this call is
+    // responsible for it. A legacy problem in an untouched section is reported but must
+    // never dead-end an unrelated edit.
+    const { findings, references } = validatePromptSections(finalSections, vocabulary);
+    const writingTitles = new Set(incoming.map((s) => s.section_title.trim().toLowerCase()));
+    const blocking: Finding[] = [];
+    const preExisting: Finding[] = [];
+    for (const finding of findings) {
+      (writingTitles.has(finding.section.trim().toLowerCase()) ? blocking : preExisting).push(finding);
+    }
+
+    if (blocking.length > 0 && !args.acknowledge_findings) {
+      const errors = blocking.filter((f) => f.severity === "error").length;
+      const warnings = blocking.length - errors;
+      return {
+        agent_id: args.agent_id,
+        version_id: versionId,
+        written: false,
+        outcome: "blocked_by_checks",
+        summary:
+          `Nothing was written. The pre-write checks found ${errors} error(s) and ${warnings} ` +
+          `warning(s) in the section(s) you are writing. Show these to the user with the ` +
+          `suggested fixes, correct the content, and call again.`,
+        findings: blocking,
+        pre_existing_issues: preExisting.length > 0 ? preExisting : undefined,
+        how_to_proceed:
+          "Fix the content and re-call. If the user has seen these findings and wants the write " +
+          "anyway, re-call with acknowledge_findings=true.",
+        reference_syntax: REFERENCE_SYNTAX_HINT,
+      };
     }
 
     let response: unknown;
@@ -152,16 +234,25 @@ export const updateAgentPromptTool = defineTool({
       throw err;
     }
 
+    const changes = buildChangeReport(existingSections, finalSections);
+
     return {
       agent_id: args.agent_id,
       version_id: versionId,
+      written: true,
+      outcome: args.acknowledge_findings && blocking.length > 0 ? "written_over_findings" : "written",
       mode,
       read_from: readSource,
+      summary: summarizeChangeReport(changes),
+      changes,
       sections_before: before,
       sections_after: finalSections.map((s) => s.section_title),
       updated,
       added,
       removed,
+      references_now_in_prompt: summarizeReferences(references),
+      acknowledged_findings: args.acknowledge_findings && blocking.length > 0 ? blocking : undefined,
+      pre_existing_issues: preExisting.length > 0 ? preExisting : undefined,
       warning:
         removed.length > 0
           ? `mode='replace' discarded ${removed.length} section(s) that were previously set: ${removed.join(", ")}`
@@ -171,6 +262,23 @@ export const updateAgentPromptTool = defineTool({
     };
   },
 });
+
+const REFERENCE_SYNTAX_HINT = {
+  custom_variable: "@{{variable_name}} - and bare in Jinja: {% if channel == 'meta' %}",
+  pre_call_tool_data: '@((tool_name.Dotted.Path)) - quote it inside Jinja: {% if "@((t.P))" == "True" %}',
+  on_call_tool: "@||tool_name||",
+  knowledge_base: "insert from the dashboard editor; it binds by UUID, not by the visible @name text",
+  control_flow: "{% if %} / {% elif %} / {% else %} / {% endif %}",
+};
+
+/** The agent's referenceable vocabulary, tolerant of a payload that could not be read. */
+function buildVocabulary(agent: Record<string, unknown>): PromptVocabulary {
+  return extractPromptVocabulary(
+    agent,
+    extractCustomVariableNames(agent),
+    extractKnowledgeBases(agent),
+  );
+}
 
 function same(a: string, b: string): boolean {
   return a.trim().toLowerCase() === b.trim().toLowerCase();

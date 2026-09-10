@@ -67,7 +67,7 @@ error message and log line.
 | Tool | Endpoint | Notes |
 |---|---|---|
 | `list_agents` | `GET /agent/all` | Paginated. `limit`/`offset` always sent explicitly. |
-| `get_agent` | `GET /agent/{agent_id}` | Prompt sections, custom variables, KB attachments (always an array), voice, languages, tools, classification labels, analysis config, A/B versions. |
+| `get_agent` | `GET /agent/{agent_id}` | Prompt sections, custom variables, KB attachments (always an array), voice, languages, tools (by phase), classification labels, analysis config, A/B versions, plus a reference audit. `include_prompt=false` drops the section bodies. |
 | `list_knowledge_bases` | `GET /external/kb/all` | Bare array upstream; no pagination. |
 | `get_knowledge_base` | `GET /external/kb/{kb_id}` | Status plus the files / URLs / FAQs inventory. |
 | `list_calls` | `GET /calling/history` | **Summaries only** — transcripts are stripped (see below). |
@@ -141,7 +141,7 @@ All writes go through `PATCH /agent/v1` with an `operation` discriminator.
 
 | Tool | Operation | Semantics |
 |---|---|---|
-| `update_agent_prompt` | `edit_prompt` | Section-wise. **Read-merge-write** by default. |
+| `update_agent_prompt` | `edit_prompt` | Section-wise. **Read-merge-write** by default. **Validated before every write** — see [Prompt reference grammar](#prompt-reference-grammar). |
 | `update_intro_message` | `edit_intro_message` | Replaces the greeting outright. Warns when it is flattening dashboard rich text. |
 | `update_custom_variables` | `edit_custom_vars` | `add` / `remove` deltas. **Read-merge-write.** |
 | `update_agent_display_name` | `edit_agent_display_name` | Cosmetic rename. Agent-level. |
@@ -348,6 +348,95 @@ into one section and then reverted. Results:
 `Introduction and Objective` · `Response Guidelines` · `Task` · `FAQ Guidelines` on one
 agent, and `Introduction and Objective` · `Response Guidelines` · `Conversation Script` ·
 `FAQs` on another. Always call `get_agent` first to read the titles actually in use.
+
+---
+
+## Prompt reference grammar
+
+A prompt section is HTML from the dashboard's rich-text editor. Beyond prose it carries
+five constructs, each with its own syntax and its own failure mode. None of this is
+documented by Ringg; it was established by reading the prompts and mention-chip markup of
+every agent in a live workspace.
+
+| Construct | Literal form | Mention chip | Binds by |
+|---|---|---|---|
+| Custom variable | `@{{name}}` | `data-source="custom_variable"` | name |
+| Pre-call tool data | `@((tool_name.Dotted.Path))` | `data-source="api"` | name + path |
+| On-call tool | `@\|\|tool_name\|\|` | `data-source="platform"` | name |
+| Knowledge base | `@kb_name` | `data-source="knowledge_base"` | **`data-id` UUID only** |
+| Control flow | `{% if %}` / `{% elif %}` / `{% else %}` / `{% endif %}` | — | — |
+
+Three semantics drive most of the mistakes:
+
+**1. `@(( ))` is substituted as text before Jinja evaluates.** Inside a `{% %}` statement
+it must therefore be quoted. Every working example in the wild reads
+`{% if "@((t.Path))" == "True" %}`; unquoted, Jinja parses the substituted text as an
+expression instead of comparing it as a string.
+
+**2. Booleans arrive as the strings `"True"` / `"False"`** — and `"False"` is *truthy* in
+Jinja, so `{% if "@((t.Flag))" %}` is always true. Compare with `== "True"`.
+
+**3. A knowledge base binds through the chip's UUID, never the visible text.** Plain
+`@kb_name` typed as prose reads like a reference and does nothing.
+
+Custom variables are the exception: they are native Jinja names, tested bare —
+`{% if channel == 'meta' %}`.
+
+`get_agent` reports the full vocabulary an agent makes referenceable (`tools` split by
+phase, with each pre-call tool's legal `response_keys`), what its prompt currently
+references (`prompt.references`), and anything that will not resolve (`prompt.issues`).
+
+**`include_prompt=false`** returns that vocabulary without the prompt bodies, substituting
+`section_titles` for `sections`. Prompt text is 78–96% of a large agent's payload — enough
+that 10 of the 18 agents in one live workspace produced a `get_agent` result too big to
+return through a tool call at all. Omitting the bodies brings 9 of those 10 under:
+
+| Agent | Full | `include_prompt=false` |
+|---|---|---|
+| test-seller-onboarding | 131,773 | 18,809 |
+| test-agent-caching | 96,024 | 12,883 |
+| Housing Agent | 65,954 | 8,803 |
+
+The audit is computed from the sections either way, so nothing diagnostic is lost — only
+the wording. Use it whenever you want the vocabulary rather than the prose, which is the
+normal case before a prompt write.
+
+The one agent still over the line afterwards is over for unrelated reasons: its
+`custom_analysis_prompt` (34KB) and `form_fields` (27KB) are the bulk, not its prompt.
+
+### Checks run before every prompt write
+
+`update_agent_prompt` validates the sections it is about to send and **writes nothing if
+it finds a problem**, returning each finding with a concrete fix. Problems in sections the
+call is *not* writing never block it; they come back as `pre_existing_issues`, so a legacy
+defect elsewhere cannot dead-end an unrelated edit. Set `acknowledge_findings=true` to
+write anyway, once the user has seen the findings.
+
+| Code | Severity | Catches |
+|---|---|---|
+| `unbalanced_interpolation` | error | a `{{` or `}}` with no match |
+| `unbalanced_statement` | error | a `{%` or `%}` with no match |
+| `unclosed_block` / `unexpected_block_end` / `orphan_branch` | error | `{% if %}` without `{% endif %}`, stray `{% endif %}`, `{% else %}` outside a block |
+| `unquoted_field_in_jinja` | error | `@(( ))` used unquoted inside `{% %}` |
+| `string_truthiness` | warning | `{% if "@((t.Flag))" %}` — always true |
+| `unknown_custom_variable` | warning | a variable the agent does not declare, in prose or in a condition |
+| `unknown_pre_call_tool` / `unknown_field_path` | warning | a tool the agent lacks, or a path absent from its `responseSelectedKeys` |
+| `unknown_on_call_tool` | warning | `@\|\|name\|\|` for a tool the agent lacks |
+| `kb_not_attached` | warning | a KB referenced by UUID but not attached |
+| `kb_reference_without_binding` | warning | `@kb_name` as plain text, which binds to nothing |
+
+The platform's own validator is partial (see 4h below): it rejects an unclosed `{% %}`
+block and an unknown tag, but accepts an unclosed `{{`, a bad filter, and every reference
+error above — so these checks are the only guard for the rest.
+
+A successful write returns a change report: per section, and per numbered step within it,
+what changed, with before/after excerpts windowed around the edit rather than the start of
+the step.
+
+Run over the 18 agents of a live workspace, the checks left 14 clean and flagged only real
+defects: a prompt referencing three knowledge-base UUIDs that exist nowhere in the
+workspace on an agent with none attached, a stray `}}` left by an earlier edit, and a
+variable that was never declared.
 
 ---
 
