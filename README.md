@@ -2,7 +2,8 @@
 
 A local MCP server exposing the [Ringg AI](https://docs.ringg.ai) voice-agent platform to
 Claude Code over stdio. Read assistants, knowledge bases and call history; make targeted
-edits to an assistant's prompt, custom variables and knowledge base attachments.
+edits to an assistant's prompt, custom variables and knowledge base attachments; transcribe
+audio with Ringg's Parrot speech-to-text.
 
 **Nothing in this server dials a phone.** There are no tools for individual calls,
 campaigns, or call termination — by design.
@@ -47,6 +48,8 @@ claude mcp add ringg -- node /absolute/path/to/RinggMCP/dist/index.js
 | `RINGG_VERIFY_ON_START` | no | `0` | `1` probes `GET /workspace` at startup to validate the key. Off by default so startup stays network-free. |
 | `RINGG_LOG_LEVEL` | no | `info` | `error` / `warn` / `info` / `debug`. All logging goes to **stderr**. |
 | `RINGG_TIMEOUT_MS` | no | `30000` | Per-request timeout. |
+| `RINGG_STT_BASE_URL` | no | `https://prod-api.ringg.ai/stt/v1` | Speech-to-text base. Same key; must be https. |
+| `RINGG_STT_TIMEOUT_MS` | no | `120000` | Timeout for one transcription, upload included. |
 
 Get a key from the Ringg dashboard under **Settings → API Key**. It is shown only once at
 generation, and regenerating immediately revokes the previous key.
@@ -83,6 +86,52 @@ response:
 | `transcript` | `false` | Metadata + conversation turns |
 | `analysis` | `true` | Metadata + platform & client analysis |
 | `full` | `true` | Everything |
+
+### Speech-to-text
+
+| Tool | Endpoint | Notes |
+|---|---|---|
+| `transcribe_audio` | `POST /stt/v1/transcriptions` | Ringg's Parrot STT. A local `file_path`, or an https `audio_url` such as a `recording_url` from `get_call`. |
+
+Parrot is a separate Ringg service with its own base URL, authenticated by the same
+workspace key. It is built for Hindi, English and code-mixed speech: English words come back
+in Latin script, Hindi in Devanagari (`आपका loan approve हो गया है`). It returns one plain
+string, with no speaker labels and no timestamps — for a Ringg call, `get_call
+view=transcript` already has the turn-by-turn transcript, so this tool is for re-transcribing
+a recording independently or for audio from elsewhere. Transcribing changes nothing in the
+workspace, but it is billed per second of audio.
+
+The service's limits were established against the live endpoint, and the tool enforces them
+**before uploading anything**:
+
+- **10,000,000 bytes per file** (`413` above that) — about 5 minutes of 16 kHz WAV, or 40
+  minutes of mono 32 kbps MP3. Larger files are refused with a compression hint.
+- **WAV, MP3, FLAC and M4A only** (`415` otherwise) — not the OGG and OPUS the product page
+  also lists. The service judges the format by file name or content type, never the bytes:
+  a WAV named `recording` is refused, while M4A bytes named `.wav` go through. So the tool
+  sniffs the container from the file's magic bytes and labels the upload to match. Anything
+  not recognisably audio is refused rather than uploaded, so a mistyped path cannot send
+  `~/.env` to a remote service.
+
+Also observed:
+
+- `language` is echoed back but neither validated (`xx` is accepted) nor, in testing,
+  influential: Hindi audio sent as `en` came back identical. Omitted, it defaults to `hi`,
+  and so does the tool.
+- `enable_cap_punc` toggles punctuation only; the text stays lower case either way.
+- Stereo is mixed to mono before recognition, so overlapping speech on the two channels of
+  a call recording blurs together.
+- 8 kHz and µ-law WAV, the usual telephony formats, transcribe fine. A 5-second clip took
+  60–90 ms to process.
+
+`audio_url` must be https, after redirects too. It is fetched with a plain request — the
+workspace key is attached only by `RinggClient` and never goes to another host — and capped
+at 10 MB while streaming, whatever `Content-Length` claims. The result echoes the URL
+without its query string, since on a signed link that is the credential. The upload is
+always named `audio.<format>`, so local file names stay local.
+
+Real-time transcription (the SDK's WebSocket `stream()`) is not exposed: a tool call has no
+live audio to stream, and the REST endpoint covers recordings.
 
 ### Write
 
@@ -189,13 +238,14 @@ src/
   config.ts              Env load + fail-fast validation. Owns the API key.
   logger.ts              stderr-ONLY logger. No stdout code path exists here.
   ringg/
-    client.ts            HTTP client: base URL, X-API-KEY, timeout, error mapping
+    client.ts            HTTP client: base URLs, X-API-KEY, timeout, error mapping
     errors.ts            Typed errors + secret redaction
     normalize.ts         Defensive readers for undocumented / inconsistent shapes
     agents.ts kb.ts calls.ts
+    stt.ts               Speech-to-text: file/URL loading, format sniffing, size cap
   tools/
-    types.ts registry.ts   ToolDefinition + the 19-tool registry
-    agents/ kb/ calls/     One file per tool
+    types.ts registry.ts   ToolDefinition + the 20-tool registry
+    agents/ kb/ calls/ stt/  One file per tool
   server.ts              createServer(deps) -> McpServer. Imports NO transport.
   transports/stdio.ts    The only stdio-aware file. Includes the stdout guard.
   index.ts               bin entrypoint
@@ -232,7 +282,7 @@ npm run build
 
 RINGG_API_KEY=... npm run probe          # live read-only probe; see below
 RINGG_API_KEY=... npm run smoke          # protocol + tools/list
-RINGG_API_KEY=... node scripts/smoke.mjs --live   # + live read-only tool calls
+RINGG_API_KEY=... node scripts/smoke.mjs --live   # + live read-only tool calls, 1 s of STT
 ```
 
 Fail-fast check — expect one stderr line, exit 1, and nothing on stdout:
@@ -268,7 +318,8 @@ Run against a live workspace on 2026-09-02.
 |---|---|
 | `typecheck` / `build` | ✅ clean |
 | Static guards (stdout, transport isolation, scope) | ✅ 4/4 |
-| Protocol + live read tools (`smoke.mjs --live`) | ✅ 21/21 |
+| Protocol + live read tools (`smoke.mjs --live`) | ✅ 25/25, re-run 2026-09-10 with `transcribe_audio` |
+| `transcribe_audio` over stdio (2026-09-10) | ✅ 27/27: WAV, M4A, FLAC, 8 kHz µ-law, extensionless file, https URLs, and every pre-upload refusal; key never sent to the audio host |
 | Fail-fast: missing / empty key, bad base URL, empty env file | ✅ exit 1, clear stderr, **0 bytes stdout** |
 | 401 handling and key redaction | ✅ actionable message, key never leaks |
 | `update_custom_variables` read-merge-write | ✅ live round trip on a throwaway agent |
@@ -549,7 +600,8 @@ To run against your own Ringg workspace:
 3. `npm run probe` — read-only. Confirms the shapes described in "Observed API behaviour"
    still hold for your workspace, and writes raw payloads to `probe-output/` (also
    gitignored). **Those payloads contain live customer data; delete them when done.**
-4. `node scripts/smoke.mjs --live` — exercises the read tools end to end.
+4. `node scripts/smoke.mjs --live` — exercises the read tools end to end, and transcribes
+   one second of generated silence.
 
 Before testing the write tools, snapshot the target agent and use a disposable one: every
 write replaces the whole field upstream.

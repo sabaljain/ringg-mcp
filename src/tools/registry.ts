@@ -9,6 +9,11 @@
  * Writes cover agent configuration, post-call analysis, and A/B versions. The flow-graph
  * operations (docs/edit-agent-api.md sections 4.6-4.8) are deliberately absent: they need
  * the node graph read back to be usable, and GET /agent/{id} does not return it.
+ *
+ * transcribe_audio is the one tool that reaches a second service: Ringg's speech-to-text,
+ * on the same workspace key. It transcribes a file and changes nothing in the workspace.
+ * Real-time (WebSocket) transcription is not exposed - a tool call has no live audio to
+ * stream, and the REST endpoint covers recordings.
  */
 
 import { addAbVersionTool } from "./agents/add-ab-version.js";
@@ -30,6 +35,7 @@ import { getCallTool } from "./calls/get-call.js";
 import { listCallsTool } from "./calls/list-calls.js";
 import { getKnowledgeBaseTool } from "./kb/get-knowledge-base.js";
 import { listKnowledgeBasesTool } from "./kb/list-knowledge-bases.js";
+import { transcribeAudioTool } from "./stt/transcribe-audio.js";
 import type { ToolDefinition } from "./types.js";
 
 export const allTools: ToolDefinition<any>[] = [
@@ -40,6 +46,8 @@ export const allTools: ToolDefinition<any>[] = [
   getKnowledgeBaseTool,
   listCallsTool,
   getCallTool,
+  // Speech-to-text
+  transcribeAudioTool,
   // Write - agent configuration
   updateAgentPromptTool,
   updateIntroMessageTool,

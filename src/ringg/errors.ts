@@ -82,8 +82,9 @@ export class RinggApiError extends Error {
   }
 
   /**
-   * Ringg returns errors in at least two shapes: `{detail: "..."}` (agent endpoints)
-   * and `{error: {code, message}}` (documented in api-overview.md). Handle both.
+   * Ringg returns errors in at least three shapes: `{detail: "..."}` (agent endpoints),
+   * `{error: {code, message}}` (documented in api-overview.md), and `{detail: {code,
+   * message}}` (the speech-to-text service). Handle all three.
    */
   private static extractDetail(body: unknown): string | undefined {
     if (!body) return undefined;
@@ -92,7 +93,7 @@ export class RinggApiError extends Error {
     const b = body as Record<string, unknown>;
     if (typeof b.detail === "string") return b.detail;
     if (typeof b.message === "string") return b.message;
-    const err = b.error;
+    const err = b.error ?? b.detail;
     if (err && typeof err === "object") {
       const e = err as Record<string, unknown>;
       const code = typeof e.code === "string" ? e.code : undefined;
