@@ -39,7 +39,8 @@ export function createServer(options: CreateServerOptions): CreatedServer {
     {
       instructions:
         "Tools for the Ringg AI voice agent platform. Read agents, knowledge bases and call " +
-        "history; edit agent prompts, custom variables and knowledge base attachments. " +
+        "history; edit agent prompts, custom variables and knowledge base attachments; " +
+        "transcribe audio with Ringg's Parrot speech-to-text. " +
         "This server cannot place, schedule or terminate calls, and cannot create or delete " +
         "knowledge bases. Writes replace data upstream, so prefer get_agent before and after " +
         "any update to confirm the effect.",

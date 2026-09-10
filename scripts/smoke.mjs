@@ -6,10 +6,14 @@
  *   node scripts/smoke.mjs                      # protocol + tools/list only
  *   node scripts/smoke.mjs --live               # also calls the read-only tools
  *
- * Requires RINGG_API_KEY. Never calls a write tool.
+ * Requires RINGG_API_KEY. Never calls a write tool. --live also transcribes one second of
+ * generated silence, which speech-to-text bills as one second of audio.
  */
 
 import { spawn } from "node:child_process";
+import { rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 
 const LIVE = process.argv.includes("--live");
 const EXPECTED_TOOLS = [
@@ -19,6 +23,7 @@ const EXPECTED_TOOLS = [
   "get_knowledge_base",
   "list_calls",
   "get_call",
+  "transcribe_audio",
   "update_agent_prompt",
   "update_intro_message",
   "update_custom_variables",
@@ -99,6 +104,26 @@ function textOf(res) {
   return res?.result?.content?.map((c) => c.text).join("\n") ?? "";
 }
 
+/** A 16 kHz mono 16-bit PCM WAV of silence. */
+function silentWav(seconds) {
+  const rate = 16_000;
+  const data = rate * 2 * seconds;
+  const b = Buffer.alloc(44 + data);
+  b.write("RIFF", 0);
+  b.writeUInt32LE(36 + data, 4);
+  b.write("WAVEfmt ", 8);
+  b.writeUInt32LE(16, 16);
+  b.writeUInt16LE(1, 20); // PCM
+  b.writeUInt16LE(1, 22); // mono
+  b.writeUInt32LE(rate, 24);
+  b.writeUInt32LE(rate * 2, 28);
+  b.writeUInt16LE(2, 32);
+  b.writeUInt16LE(16, 34);
+  b.write("data", 36);
+  b.writeUInt32LE(data, 40);
+  return b;
+}
+
 async function main() {
   process.stderr.write("\n=== stdio smoke test ===\n");
 
@@ -127,6 +152,22 @@ async function main() {
   check(
     "every tool has an input schema",
     (list.result?.tools ?? []).every((t) => t.inputSchema && t.inputSchema.type === "object"),
+  );
+
+  // Refused locally, so these make no network request.
+  const notAudio = await send("tools/call", {
+    name: "transcribe_audio",
+    arguments: { file_path: resolve("package.json") },
+  });
+  check(
+    "transcribe_audio refuses a non-audio file before uploading",
+    notAudio.result?.isError === true && /not a recognised audio file/.test(textOf(notAudio)),
+    textOf(notAudio).slice(0, 120),
+  );
+  const relative = await send("tools/call", { name: "transcribe_audio", arguments: { file_path: "a.wav" } });
+  check(
+    "transcribe_audio refuses a relative path",
+    relative.result?.isError === true && /must be absolute/.test(textOf(relative)),
   );
 
   if (LIVE) {
@@ -187,6 +228,24 @@ async function main() {
       arguments: { agent_id: "00000000-0000-0000-0000-000000000000" },
     });
     check("unknown agent returns a tool error, not a crash", bad.result?.isError === true, textOf(bad).slice(0, 160));
+
+    const wav = join(tmpdir(), `ringg-smoke-${process.pid}.wav`);
+    writeFileSync(wav, silentWav(1));
+    try {
+      const stt = await send("tools/call", { name: "transcribe_audio", arguments: { file_path: wav } });
+      const ok = !stt.result?.isError;
+      check("transcribe_audio", ok, ok ? "" : textOf(stt).slice(0, 200));
+      if (ok) {
+        const parsed = JSON.parse(textOf(stt));
+        check(
+          "transcribe_audio returns an empty transcription for silence",
+          parsed.transcription === "" && parsed.duration_seconds === 1,
+          JSON.stringify({ transcription: parsed.transcription, duration_seconds: parsed.duration_seconds }),
+        );
+      }
+    } finally {
+      rmSync(wav, { force: true });
+    }
   }
 
   // The headline stdio assertion.

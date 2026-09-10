@@ -10,6 +10,9 @@
  *   GET /external/kb/all    -> [ ... ]                      (bare array)
  *   GET /calling/history    -> { calls: [...], limit, ... } (no wrapper)
  *   GET /calling/call-details -> { status, data: {...} }
+ *
+ * Speech-to-text is a separate service under its own base URL (RINGG_STT_BASE_URL). The
+ * same workspace key authenticates it, so its requests come through here too.
  */
 
 import type { Config } from "../config.js";
@@ -28,19 +31,26 @@ export interface RequestOptions {
   method: "GET" | "POST" | "PATCH" | "DELETE";
   path: string;
   query?: Query;
+  /** Sent as JSON, except FormData, which goes out as multipart with fetch's own boundary. */
   body?: unknown;
+  /** Which service `path` is relative to. Defaults to the platform API. */
+  service?: "platform" | "stt";
 }
 
 export class RinggClient {
   readonly #apiKey: string;
   readonly #baseUrl: string;
+  readonly #sttBaseUrl: string;
   readonly #timeoutMs: number;
+  readonly #sttTimeoutMs: number;
   readonly #log: Logger;
 
   constructor(config: Config, logger: Logger) {
     this.#apiKey = config.apiKey;
     this.#baseUrl = config.baseUrl;
+    this.#sttBaseUrl = config.sttBaseUrl;
     this.#timeoutMs = config.timeoutMs;
+    this.#sttTimeoutMs = config.sttTimeoutMs;
     this.#log = logger;
     registerSecret(config.apiKey);
   }
@@ -49,8 +59,8 @@ export class RinggClient {
     return this.#baseUrl;
   }
 
-  #buildUrl(path: string, query?: Query): string {
-    const url = new URL(this.#baseUrl + path);
+  #buildUrl(base: string, path: string, query?: Query): string {
+    const url = new URL(base + path);
     if (query) {
       for (const [key, value] of Object.entries(query)) {
         if (value === undefined || value === null || value === "") continue;
@@ -61,32 +71,38 @@ export class RinggClient {
   }
 
   async request<T = unknown>(options: RequestOptions): Promise<T> {
-    const { method, path, query, body } = options;
-    const url = this.#buildUrl(path, query);
+    const { method, query, body } = options;
+    const stt = options.service === "stt";
+    const url = this.#buildUrl(stt ? this.#sttBaseUrl : this.#baseUrl, options.path, query);
+    // Errors and logs name the path. An STT path carries its service prefix so it cannot
+    // be mistaken for a platform endpoint.
+    const path = stt ? new URL(url).pathname : options.path;
+    const timeoutMs = stt ? this.#sttTimeoutMs : this.#timeoutMs;
+    const isForm = body instanceof FormData;
 
     const headers: Record<string, string> = {
       "X-API-KEY": this.#apiKey,
       Accept: "application/json",
     };
-    if (body !== undefined) headers["Content-Type"] = "application/json";
+    if (body !== undefined && !isForm) headers["Content-Type"] = "application/json";
 
     // Log the path and query but never the headers - they carry the key.
     this.#log.debug("ringg request", { method, path, query: query ?? {} });
 
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.#timeoutMs);
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
 
     let response: Response;
     try {
       response = await fetch(url, {
         method,
         headers,
-        body: body === undefined ? undefined : JSON.stringify(body),
+        body: body === undefined ? undefined : isForm ? body : JSON.stringify(body),
         signal: controller.signal,
       });
     } catch (err) {
       if (controller.signal.aborted) {
-        throw new RinggTimeoutError(method, path, this.#timeoutMs);
+        throw new RinggTimeoutError(method, path, timeoutMs);
       }
       throw new RinggTransportError(method, path, err);
     } finally {
@@ -123,6 +139,11 @@ export class RinggClient {
 
   patch<T = unknown>(path: string, body: unknown): Promise<T> {
     return this.request<T>({ method: "PATCH", path, body });
+  }
+
+  /** Multipart POST to the speech-to-text service. */
+  postStt<T = unknown>(path: string, form: FormData): Promise<T> {
+    return this.request<T>({ method: "POST", path, body: form, service: "stt" });
   }
 
   /**

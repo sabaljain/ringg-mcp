@@ -30,6 +30,14 @@ import {
   type PromptSection,
   type PromptSectionsResult,
 } from "./normalize.js";
+import {
+  extractPhaseTools,
+  extractPromptVocabulary,
+  summarizeReferences,
+  validatePromptSections,
+  type Finding,
+  type PhaseTools,
+} from "./prompt-refs.js";
 
 /**
  * Operations accepted by PATCH /agent/v1 that this server drives.
@@ -135,7 +143,8 @@ export interface AgentDetail {
   template_type?: string;
   created_at?: string;
   updated_at?: string;
-  tools?: unknown;
+  /** Tools split by phase. `readable: false` means the payload exposed none to read. */
+  tools?: PhaseTools;
   /** Names only. NOT the same as form_fields - see normalize.ts. */
   custom_variables: string[];
   /**
@@ -162,10 +171,19 @@ export interface AgentDetail {
   /** Every A/B version with its slug and traffic share. */
   ab_versions: AbVersionInfo[];
   prompt: {
-    sections: PromptSection[] | null;
+    /** Null when none were found; absent entirely when include_prompt was false. */
+    sections?: PromptSection[] | null;
+    /** Set instead of `sections` when the caller asked to omit the prompt body. */
+    sections_omitted?: true;
+    /** Titles are kept even when the bodies are omitted: writes are matched by title. */
+    section_titles?: string[] | null;
     /** Where the sections were found, or why they were not. */
     source: string;
     synthesized: boolean;
+    /** What the prompt references, by kind. See prompt-refs.ts for the grammar. */
+    references?: Record<string, string[]>;
+    /** References that will not resolve on a live call. Absent when there are none. */
+    issues?: Finding[];
   };
 }
 
@@ -208,12 +226,28 @@ export async function getAgentRaw(client: RinggClient, agentId: string): Promise
   return unwrapAgentDetail(res);
 }
 
-export async function getAgent(client: RinggClient, agentId: string): Promise<AgentDetail> {
-  const agent = await getAgentRaw(client, agentId);
-  return toAgentDetail(agent);
+export interface AgentDetailOptions {
+  /**
+   * Include the prompt section bodies. Default true.
+   *
+   * The bodies are 78-96% of a large agent's payload, enough to push a single read past
+   * what a tool result can carry. Omitting them keeps the titles, the referenceable
+   * vocabulary and the reference audit - everything needed to prepare a prompt write.
+   */
+  includePrompt?: boolean;
 }
 
-export function toAgentDetail(agent: Json): AgentDetail {
+export async function getAgent(
+  client: RinggClient,
+  agentId: string,
+  options: AgentDetailOptions = {},
+): Promise<AgentDetail> {
+  const agent = await getAgentRaw(client, agentId);
+  return toAgentDetail(agent, options);
+}
+
+export function toAgentDetail(agent: Json, options: AgentDetailOptions = {}): AgentDetail {
+  const includePrompt = options.includePrompt !== false;
   const prompt = extractPromptSections(agent);
   const active = getActiveVersion(agent);
 
@@ -250,7 +284,7 @@ export function toAgentDetail(agent: Json): AgentDetail {
     template_type: str(agent.template_type),
     created_at: str(agent.created_at),
     updated_at: str(agent.updated_at),
-    tools: pick("tools"),
+    tools: extractPhaseTools(agent),
     custom_variables: extractCustomVariableNames(agent),
     form_fields: agent.form_fields,
     knowledge_bases: extractKnowledgeBases(agent),
@@ -262,13 +296,46 @@ export function toAgentDetail(agent: Json): AgentDetail {
     analytics_context: readVersionField(agent, "analytics_context").value,
     ab_versions: extractAbVersions(agent),
     prompt: {
-      sections: prompt?.sections ?? null,
+      // The audit runs either way: it is computed from the sections, not from whether
+      // the caller wanted them echoed back, so omitting the bodies loses no diagnostics.
+      ...(includePrompt
+        ? { sections: prompt?.sections ?? null }
+        : {
+            sections_omitted: true as const,
+            section_titles: prompt?.sections.map((s) => s.section_title) ?? null,
+          }),
       source: prompt
         ? `found at ${prompt.sourcePath}${prompt.synthesized ? " (synthesized from flat prompt fields)" : ""}` +
           (prompt.versionInferred ? " [active version was inferred, not declared]" : "")
         : "not found - the agent payload contains no recognizable prompt sections",
       synthesized: prompt?.synthesized ?? false,
+      ...auditPrompt(agent, prompt),
     },
+  };
+}
+
+/**
+ * What the prompt references, and anything wrong with it.
+ *
+ * Reported on a plain read so a broken reference can be found by looking at the agent,
+ * rather than only by attempting a write. Every issue here is one the platform accepts
+ * silently: a variable that interpolates to nothing, a knowledge base that is referenced
+ * but not attached, a tool field path that does not exist.
+ */
+function auditPrompt(
+  agent: Json,
+  prompt: PromptSectionsResult | null,
+): { references?: Record<string, string[]>; issues?: Finding[] } {
+  if (!prompt || prompt.sections.length === 0) return {};
+  const vocabulary = extractPromptVocabulary(
+    agent,
+    extractCustomVariableNames(agent),
+    extractKnowledgeBases(agent),
+  );
+  const { findings, references } = validatePromptSections(prompt.sections, vocabulary);
+  return {
+    references: summarizeReferences(references),
+    ...(findings.length > 0 ? { issues: findings } : {}),
   };
 }
 

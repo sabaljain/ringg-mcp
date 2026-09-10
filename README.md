@@ -2,7 +2,8 @@
 
 A local MCP server exposing the [Ringg AI](https://docs.ringg.ai) voice-agent platform to
 Claude Code over stdio. Read assistants, knowledge bases and call history; make targeted
-edits to an assistant's prompt, custom variables and knowledge base attachments.
+edits to an assistant's prompt, custom variables and knowledge base attachments; transcribe
+audio with Ringg's Parrot speech-to-text.
 
 **Nothing in this server dials a phone.** There are no tools for individual calls,
 campaigns, or call termination — by design.
@@ -47,6 +48,8 @@ claude mcp add ringg -- node /absolute/path/to/RinggMCP/dist/index.js
 | `RINGG_VERIFY_ON_START` | no | `0` | `1` probes `GET /workspace` at startup to validate the key. Off by default so startup stays network-free. |
 | `RINGG_LOG_LEVEL` | no | `info` | `error` / `warn` / `info` / `debug`. All logging goes to **stderr**. |
 | `RINGG_TIMEOUT_MS` | no | `30000` | Per-request timeout. |
+| `RINGG_STT_BASE_URL` | no | `https://prod-api.ringg.ai/stt/v1` | Speech-to-text base. Same key; must be https. |
+| `RINGG_STT_TIMEOUT_MS` | no | `120000` | Timeout for one transcription, upload included. |
 
 Get a key from the Ringg dashboard under **Settings → API Key**. It is shown only once at
 generation, and regenerating immediately revokes the previous key.
@@ -64,7 +67,7 @@ error message and log line.
 | Tool | Endpoint | Notes |
 |---|---|---|
 | `list_agents` | `GET /agent/all` | Paginated. `limit`/`offset` always sent explicitly. |
-| `get_agent` | `GET /agent/{agent_id}` | Prompt sections, custom variables, KB attachments (always an array), voice, languages, tools, classification labels, analysis config, A/B versions. |
+| `get_agent` | `GET /agent/{agent_id}` | Prompt sections, custom variables, KB attachments (always an array), voice, languages, tools (by phase), classification labels, analysis config, A/B versions, plus a reference audit. `include_prompt=false` drops the section bodies. |
 | `list_knowledge_bases` | `GET /external/kb/all` | Bare array upstream; no pagination. |
 | `get_knowledge_base` | `GET /external/kb/{kb_id}` | Status plus the files / URLs / FAQs inventory. |
 | `list_calls` | `GET /calling/history` | **Summaries only** — transcripts are stripped (see below). |
@@ -84,6 +87,52 @@ response:
 | `analysis` | `true` | Metadata + platform & client analysis |
 | `full` | `true` | Everything |
 
+### Speech-to-text
+
+| Tool | Endpoint | Notes |
+|---|---|---|
+| `transcribe_audio` | `POST /stt/v1/transcriptions` | Ringg's Parrot STT. A local `file_path`, or an https `audio_url` such as a `recording_url` from `get_call`. |
+
+Parrot is a separate Ringg service with its own base URL, authenticated by the same
+workspace key. It is built for Hindi, English and code-mixed speech: English words come back
+in Latin script, Hindi in Devanagari (`आपका loan approve हो गया है`). It returns one plain
+string, with no speaker labels and no timestamps — for a Ringg call, `get_call
+view=transcript` already has the turn-by-turn transcript, so this tool is for re-transcribing
+a recording independently or for audio from elsewhere. Transcribing changes nothing in the
+workspace, but it is billed per second of audio.
+
+The service's limits were established against the live endpoint, and the tool enforces them
+**before uploading anything**:
+
+- **10,000,000 bytes per file** (`413` above that) — about 5 minutes of 16 kHz WAV, or 40
+  minutes of mono 32 kbps MP3. Larger files are refused with a compression hint.
+- **WAV, MP3, FLAC and M4A only** (`415` otherwise) — not the OGG and OPUS the product page
+  also lists. The service judges the format by file name or content type, never the bytes:
+  a WAV named `recording` is refused, while M4A bytes named `.wav` go through. So the tool
+  sniffs the container from the file's magic bytes and labels the upload to match. Anything
+  not recognisably audio is refused rather than uploaded, so a mistyped path cannot send
+  `~/.env` to a remote service.
+
+Also observed:
+
+- `language` is echoed back but neither validated (`xx` is accepted) nor, in testing,
+  influential: Hindi audio sent as `en` came back identical. Omitted, it defaults to `hi`,
+  and so does the tool.
+- `enable_cap_punc` toggles punctuation only; the text stays lower case either way.
+- Stereo is mixed to mono before recognition, so overlapping speech on the two channels of
+  a call recording blurs together.
+- 8 kHz and µ-law WAV, the usual telephony formats, transcribe fine. A 5-second clip took
+  60–90 ms to process.
+
+`audio_url` must be https, after redirects too. It is fetched with a plain request — the
+workspace key is attached only by `RinggClient` and never goes to another host — and capped
+at 10 MB while streaming, whatever `Content-Length` claims. The result echoes the URL
+without its query string, since on a signed link that is the credential. The upload is
+always named `audio.<format>`, so local file names stay local.
+
+Real-time transcription (the SDK's WebSocket `stream()`) is not exposed: a tool call has no
+live audio to stream, and the REST endpoint covers recordings.
+
 ### Write
 
 All writes go through `PATCH /agent/v1` with an `operation` discriminator.
@@ -92,7 +141,7 @@ All writes go through `PATCH /agent/v1` with an `operation` discriminator.
 
 | Tool | Operation | Semantics |
 |---|---|---|
-| `update_agent_prompt` | `edit_prompt` | Section-wise. **Read-merge-write** by default. |
+| `update_agent_prompt` | `edit_prompt` | Section-wise. **Read-merge-write** by default. **Validated before every write** — see [Prompt reference grammar](#prompt-reference-grammar). |
 | `update_intro_message` | `edit_intro_message` | Replaces the greeting outright. Warns when it is flattening dashboard rich text. |
 | `update_custom_variables` | `edit_custom_vars` | `add` / `remove` deltas. **Read-merge-write.** |
 | `update_agent_display_name` | `edit_agent_display_name` | Cosmetic rename. Agent-level. |
@@ -189,13 +238,14 @@ src/
   config.ts              Env load + fail-fast validation. Owns the API key.
   logger.ts              stderr-ONLY logger. No stdout code path exists here.
   ringg/
-    client.ts            HTTP client: base URL, X-API-KEY, timeout, error mapping
+    client.ts            HTTP client: base URLs, X-API-KEY, timeout, error mapping
     errors.ts            Typed errors + secret redaction
     normalize.ts         Defensive readers for undocumented / inconsistent shapes
     agents.ts kb.ts calls.ts
+    stt.ts               Speech-to-text: file/URL loading, format sniffing, size cap
   tools/
-    types.ts registry.ts   ToolDefinition + the 19-tool registry
-    agents/ kb/ calls/     One file per tool
+    types.ts registry.ts   ToolDefinition + the 20-tool registry
+    agents/ kb/ calls/ stt/  One file per tool
   server.ts              createServer(deps) -> McpServer. Imports NO transport.
   transports/stdio.ts    The only stdio-aware file. Includes the stdout guard.
   index.ts               bin entrypoint
@@ -232,7 +282,7 @@ npm run build
 
 RINGG_API_KEY=... npm run probe          # live read-only probe; see below
 RINGG_API_KEY=... npm run smoke          # protocol + tools/list
-RINGG_API_KEY=... node scripts/smoke.mjs --live   # + live read-only tool calls
+RINGG_API_KEY=... node scripts/smoke.mjs --live   # + live read-only tool calls, 1 s of STT
 ```
 
 Fail-fast check — expect one stderr line, exit 1, and nothing on stdout:
@@ -268,7 +318,8 @@ Run against a live workspace on 2026-09-02.
 |---|---|
 | `typecheck` / `build` | ✅ clean |
 | Static guards (stdout, transport isolation, scope) | ✅ 4/4 |
-| Protocol + live read tools (`smoke.mjs --live`) | ✅ 21/21 |
+| Protocol + live read tools (`smoke.mjs --live`) | ✅ 25/25, re-run 2026-09-10 with `transcribe_audio` |
+| `transcribe_audio` over stdio (2026-09-10) | ✅ 27/27: WAV, M4A, FLAC, 8 kHz µ-law, extensionless file, https URLs, and every pre-upload refusal; key never sent to the audio host |
 | Fail-fast: missing / empty key, bad base URL, empty env file | ✅ exit 1, clear stderr, **0 bytes stdout** |
 | 401 handling and key redaction | ✅ actionable message, key never leaks |
 | `update_custom_variables` read-merge-write | ✅ live round trip on a throwaway agent |
@@ -297,6 +348,95 @@ into one section and then reverted. Results:
 `Introduction and Objective` · `Response Guidelines` · `Task` · `FAQ Guidelines` on one
 agent, and `Introduction and Objective` · `Response Guidelines` · `Conversation Script` ·
 `FAQs` on another. Always call `get_agent` first to read the titles actually in use.
+
+---
+
+## Prompt reference grammar
+
+A prompt section is HTML from the dashboard's rich-text editor. Beyond prose it carries
+five constructs, each with its own syntax and its own failure mode. None of this is
+documented by Ringg; it was established by reading the prompts and mention-chip markup of
+every agent in a live workspace.
+
+| Construct | Literal form | Mention chip | Binds by |
+|---|---|---|---|
+| Custom variable | `@{{name}}` | `data-source="custom_variable"` | name |
+| Pre-call tool data | `@((tool_name.Dotted.Path))` | `data-source="api"` | name + path |
+| On-call tool | `@\|\|tool_name\|\|` | `data-source="platform"` | name |
+| Knowledge base | `@kb_name` | `data-source="knowledge_base"` | **`data-id` UUID only** |
+| Control flow | `{% if %}` / `{% elif %}` / `{% else %}` / `{% endif %}` | — | — |
+
+Three semantics drive most of the mistakes:
+
+**1. `@(( ))` is substituted as text before Jinja evaluates.** Inside a `{% %}` statement
+it must therefore be quoted. Every working example in the wild reads
+`{% if "@((t.Path))" == "True" %}`; unquoted, Jinja parses the substituted text as an
+expression instead of comparing it as a string.
+
+**2. Booleans arrive as the strings `"True"` / `"False"`** — and `"False"` is *truthy* in
+Jinja, so `{% if "@((t.Flag))" %}` is always true. Compare with `== "True"`.
+
+**3. A knowledge base binds through the chip's UUID, never the visible text.** Plain
+`@kb_name` typed as prose reads like a reference and does nothing.
+
+Custom variables are the exception: they are native Jinja names, tested bare —
+`{% if channel == 'meta' %}`.
+
+`get_agent` reports the full vocabulary an agent makes referenceable (`tools` split by
+phase, with each pre-call tool's legal `response_keys`), what its prompt currently
+references (`prompt.references`), and anything that will not resolve (`prompt.issues`).
+
+**`include_prompt=false`** returns that vocabulary without the prompt bodies, substituting
+`section_titles` for `sections`. Prompt text is 78–96% of a large agent's payload — enough
+that 10 of the 18 agents in one live workspace produced a `get_agent` result too big to
+return through a tool call at all. Omitting the bodies brings 9 of those 10 under:
+
+| Agent | Full | `include_prompt=false` |
+|---|---|---|
+| test-seller-onboarding | 131,773 | 18,809 |
+| test-agent-caching | 96,024 | 12,883 |
+| Housing Agent | 65,954 | 8,803 |
+
+The audit is computed from the sections either way, so nothing diagnostic is lost — only
+the wording. Use it whenever you want the vocabulary rather than the prose, which is the
+normal case before a prompt write.
+
+The one agent still over the line afterwards is over for unrelated reasons: its
+`custom_analysis_prompt` (34KB) and `form_fields` (27KB) are the bulk, not its prompt.
+
+### Checks run before every prompt write
+
+`update_agent_prompt` validates the sections it is about to send and **writes nothing if
+it finds a problem**, returning each finding with a concrete fix. Problems in sections the
+call is *not* writing never block it; they come back as `pre_existing_issues`, so a legacy
+defect elsewhere cannot dead-end an unrelated edit. Set `acknowledge_findings=true` to
+write anyway, once the user has seen the findings.
+
+| Code | Severity | Catches |
+|---|---|---|
+| `unbalanced_interpolation` | error | a `{{` or `}}` with no match |
+| `unbalanced_statement` | error | a `{%` or `%}` with no match |
+| `unclosed_block` / `unexpected_block_end` / `orphan_branch` | error | `{% if %}` without `{% endif %}`, stray `{% endif %}`, `{% else %}` outside a block |
+| `unquoted_field_in_jinja` | error | `@(( ))` used unquoted inside `{% %}` |
+| `string_truthiness` | warning | `{% if "@((t.Flag))" %}` — always true |
+| `unknown_custom_variable` | warning | a variable the agent does not declare, in prose or in a condition |
+| `unknown_pre_call_tool` / `unknown_field_path` | warning | a tool the agent lacks, or a path absent from its `responseSelectedKeys` |
+| `unknown_on_call_tool` | warning | `@\|\|name\|\|` for a tool the agent lacks |
+| `kb_not_attached` | warning | a KB referenced by UUID but not attached |
+| `kb_reference_without_binding` | warning | `@kb_name` as plain text, which binds to nothing |
+
+The platform's own validator is partial (see 4h below): it rejects an unclosed `{% %}`
+block and an unknown tag, but accepts an unclosed `{{`, a bad filter, and every reference
+error above — so these checks are the only guard for the rest.
+
+A successful write returns a change report: per section, and per numbered step within it,
+what changed, with before/after excerpts windowed around the edit rather than the start of
+the step.
+
+Run over the 18 agents of a live workspace, the checks left 14 clean and flagged only real
+defects: a prompt referencing three knowledge-base UUIDs that exist nowhere in the
+workspace on an agent with none attached, a stray `}}` left by an earlier edit, and a
+variable that was never declared.
 
 ---
 
@@ -549,7 +689,8 @@ To run against your own Ringg workspace:
 3. `npm run probe` — read-only. Confirms the shapes described in "Observed API behaviour"
    still hold for your workspace, and writes raw payloads to `probe-output/` (also
    gitignored). **Those payloads contain live customer data; delete them when done.**
-4. `node scripts/smoke.mjs --live` — exercises the read tools end to end.
+4. `node scripts/smoke.mjs --live` — exercises the read tools end to end, and transcribes
+   one second of generated silence.
 
 Before testing the write tools, snapshot the target agent and use a disposable one: every
 write replaces the whole field upstream.

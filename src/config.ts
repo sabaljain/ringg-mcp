@@ -11,7 +11,9 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const DEFAULT_BASE_URL = "https://prod-api.ringg.ai/ca/api/v0";
+export const DEFAULT_STT_BASE_URL = "https://prod-api.ringg.ai/stt/v1";
 export const DEFAULT_TIMEOUT_MS = 30_000;
+export const DEFAULT_STT_TIMEOUT_MS = 120_000;
 
 export type LogLevel = "error" | "warn" | "info" | "debug";
 
@@ -20,8 +22,12 @@ export interface Config {
   apiKey: string;
   /** Base URL with no trailing slash. */
   baseUrl: string;
+  /** Speech-to-text base URL with no trailing slash. A separate service; the same key. */
+  sttBaseUrl: string;
   /** Per-request timeout in milliseconds. */
   timeoutMs: number;
+  /** Timeout for one transcription request, upload included. */
+  sttTimeoutMs: number;
   /** Whether to probe GET /workspace at startup to validate the key. */
   verifyOnStart: boolean;
   logLevel: LogLevel;
@@ -43,6 +49,21 @@ function parsePositiveInt(raw: string | undefined, fallback: number, name: strin
     throw new ConfigError(`${name} must be a positive integer. Received: ${raw}`);
   }
   return parsed;
+}
+
+function parseBaseUrl(raw: string | undefined, fallback: string, name: string): string {
+  const trimmed = raw?.trim();
+  const baseUrl = (trimmed && trimmed.length > 0 ? trimmed : fallback).replace(/\/+$/, "");
+  let parsed: URL;
+  try {
+    parsed = new URL(baseUrl);
+  } catch {
+    throw new ConfigError(`${name} is not a valid URL. Received: ${baseUrl}`);
+  }
+  if (parsed.protocol !== "https:" && parsed.hostname !== "localhost" && parsed.hostname !== "127.0.0.1") {
+    throw new ConfigError(`${name} must use https. Received: ${baseUrl}`);
+  }
+  return baseUrl;
 }
 
 function parseBool(raw: string | undefined, fallback: boolean): boolean {
@@ -112,17 +133,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     );
   }
 
-  const rawBase = env.RINGG_BASE_URL?.trim();
-  const baseUrl = (rawBase && rawBase.length > 0 ? rawBase : DEFAULT_BASE_URL).replace(/\/+$/, "");
-  try {
-    const parsed = new URL(baseUrl);
-    if (parsed.protocol !== "https:" && parsed.hostname !== "localhost" && parsed.hostname !== "127.0.0.1") {
-      throw new ConfigError(`RINGG_BASE_URL must use https. Received: ${baseUrl}`);
-    }
-  } catch (err) {
-    if (err instanceof ConfigError) throw err;
-    throw new ConfigError(`RINGG_BASE_URL is not a valid URL. Received: ${baseUrl}`);
-  }
+  const baseUrl = parseBaseUrl(env.RINGG_BASE_URL, DEFAULT_BASE_URL, "RINGG_BASE_URL");
+  const sttBaseUrl = parseBaseUrl(env.RINGG_STT_BASE_URL, DEFAULT_STT_BASE_URL, "RINGG_STT_BASE_URL");
 
   const rawLevel = env.RINGG_LOG_LEVEL?.trim().toLowerCase();
   const logLevel = (LOG_LEVELS as readonly string[]).includes(rawLevel ?? "")
@@ -132,7 +144,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   return {
     apiKey,
     baseUrl,
+    sttBaseUrl,
     timeoutMs: parsePositiveInt(env.RINGG_TIMEOUT_MS, DEFAULT_TIMEOUT_MS, "RINGG_TIMEOUT_MS"),
+    sttTimeoutMs: parsePositiveInt(env.RINGG_STT_TIMEOUT_MS, DEFAULT_STT_TIMEOUT_MS, "RINGG_STT_TIMEOUT_MS"),
     verifyOnStart: parseBool(env.RINGG_VERIFY_ON_START, false),
     logLevel,
   };
